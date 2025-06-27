@@ -1,0 +1,13 @@
+flask
+requests
+APScheduler
+python-dotenv
+numpy==1.26.4
+telegram
+pandas
+mplfinance
+matplotlib
+websocket-client
+
+
+

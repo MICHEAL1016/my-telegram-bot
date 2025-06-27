@@ -1,0 +1,21 @@
+entrypoint = "main.py"
+modules = ["python-3.11"]
+
+[nix]
+channel = "stable-24_05"
+packages = ["cairo", "dtools", "ffmpeg-full", "freetype", "ghostscript", "glibcLocales", "gobject-introspection", "gtk3", "imagemagick_light", "libgcc", "lsof", "mailutils", "nano", "openssh", "pkg-config", "python311Packages.autopep8", "python312Packages.black", "qhull", "run", "tcl", "tk", "zlib"]
+
+[unitTest]
+language = "python3"
+
+[gitHubImport]
+requiredFiles = [".replit", "replit.nix"]
+
+[deployment]
+run = ["python3", "main.py"]
+deploymentTarget = "gce"
+ignorePorts = true
+
+[[ports]]
+localPort = 8080
+externalPort = 80

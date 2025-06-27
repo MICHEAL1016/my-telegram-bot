@@ -1,0 +1,214 @@
+{
+  "BTCUSDT": {
+    "side": "short",
+    "entry": 107853.9,
+    "sl": 104429.8429,
+    "tp1": 103287.7571,
+    "tp2": 102716.7143,
+    "entered": false,
+    "tp1_hit": false,
+    "entry_actual": 103419.4,
+    "last_trend": "up"
+  },
+  "ETHUSDT": {
+    "side": "short",
+    "entry": 2723.78,
+    "sl": 2629.1186,
+    "tp1": 2563.8414,
+    "tp2": 2531.2029,
+    "entered": false,
+    "tp1_hit": false,
+    "entry_actual": 2510.24
+  },
+  "BNBUSDT": {
+    "side": "short",
+    "entry": 673.3,
+    "sl": 662.2071,
+    "tp1": 653.7929,
+    "tp2": 649.5857,
+    "entered": false,
+    "tp1_hit": false,
+    "entry_actual": 645.5
+  },
+  "SOLUSDT": {
+    "side": "short",
+    "entry": 171.97,
+    "sl": 174.6729,
+    "tp1": 170.0471,
+    "tp2": 167.7343,
+    "entered": false,
+    "tp1_hit": true,
+    "entry_actual": 169.25,
+    "last_trend": "up"
+  },
+  "XRPUSDT": {
+    "side": "long",
+    "entry": 2.1883,
+    "sl": 2.4453,
+    "tp1": 2.3903,
+    "tp2": 2.3628,
+    "entered": false,
+    "tp1_hit": true,
+    "entry_actual": 2.3789,
+    "last_trend": "up"
+  },
+  "OPUSDT": {
+    "side": "short",
+    "entry": 0.6843,
+    "sl": 0.78,
+    "tp1": 0.746,
+    "tp2": 0.729,
+    "entered": false,
+    "tp1_hit": false,
+    "entry_actual": 0.7155
+  },
+  "DOGEUSDT": {
+    "side": "long",
+    "entry": 0.20489,
+    "sl": 0.2305,
+    "tp1": 0.2224,
+    "tp2": 0.2183,
+    "entered": false,
+    "tp1_hit": true,
+    "entry_actual": 0.21933,
+    "last_trend": "up"
+  },
+  "ARBUSDT": {
+    "side": "short",
+    "entry": 0.4244,
+    "sl": 0.4204,
+    "tp1": 0.4046,
+    "tp2": 0.3967,
+    "entered": false,
+    "tp1_hit": false,
+    "entry_actual": 0.3914
+  },
+  "ENJUSDT": {
+    "entry": 0.0774,
+    "side": "long"
+  },
+  "SXPUSDT": {
+    "entry": 0.1816,
+    "side": "long"
+  },
+  "AAVEUSDT": {
+    "entry": 266.83,
+    "side": "short"
+  },
+  "APEUSDT": {
+    "entry": 0.7224,
+    "side": "short"
+  },
+  "TRUMPUSDT": {
+    "entry": 11.21,
+    "side": "long"
+  },
+  "UNIUSDT": {
+    "entry": 6.585,
+    "side": "short"
+  },
+  "MOODENGUSDT": {
+    "entry": 0.21532,
+    "side": "short"
+  },
+  "ADAUSDT": {
+    "entry": 0.6596,
+    "side": "long"
+  },
+  "NEARUSDT": {
+    "entry": 2.913,
+    "side": "short"
+  },
+  "CRVUSDT": {
+    "entry": 0.7813,
+    "side": "short"
+  },
+  "BCHUSDT": {
+    "entry": 422.1,
+    "side": "short"
+  },
+  "ETCUSDT": {
+    "entry": 17.566,
+    "side": "long"
+  },
+  "LINKUSDT": {
+    "entry": 14.511,
+    "side": "long"
+  },
+  "SANDUSDT": {
+    "entry": 0.2804,
+    "side": "long"
+  },
+  "GALAUSDT": {
+    "entry": 0.01953,
+    "side": "short"
+  },
+  "WIFUSDT": {
+    "entry": 1.0053,
+    "side": "short"
+  },
+  "ATOMUSDT": {
+    "entry": 4.29,
+    "side": "long"
+  },
+  "FILUSDT": {
+    "entry": 2.526,
+    "side": "long"
+  },
+  "UMAUSDT": {
+    "entry": 1.235,
+    "side": "short"
+  },
+  "1000BONKUSDT": {
+    "entry": 0.020148,
+    "side": "short"
+  },
+  "SUSHIUSDT": {
+    "entry": 0.6354,
+    "side": "long"
+  },
+  "YFIUSDT": {
+    "entry": 5316.0,
+    "side": "long"
+  },
+  "LTCUSDT": {
+    "entry": 96.83,
+    "side": "short"
+  },
+  "COMPUSDT": {
+    "entry": 42.46,
+    "side": "long"
+  },
+  "BALUSDT": {
+    "entry": 1.168,
+    "side": "long"
+  },
+  "AXSUSDT": {
+    "entry": 2.655,
+    "side": "long"
+  },
+  "SNXUSDT": {
+    "entry": 0.7146,
+    "side": "long"
+  },
+  "ZRXUSDT": {
+    "entry": 0.2398,
+    "side": "long"
+  },
+  "LRCUSDT": {
+    "entry": 0.08878,
+    "side": "long"
+  },
+  "BATUSDT": {
+    "entry": 0.1274,
+    "side": "long"
+  },
+  "KNCUSDT": {
+    "entry": 0.3134,
+    "side": "long"
+  },
+  "MANAUSDT": {
+    "entry": 0.267,
+    "side": "long"
+  }
+}
