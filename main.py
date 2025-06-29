@@ -548,8 +548,8 @@ def best_intraday_signal_scan():
 
         score, conf, reasons = score_signal(symbol, candles_15m, candles_1h, candles_4h, side=side)
 
-        if score < SCORE_THRESHOLD_WEAK:
-            logger.info(f"{symbol}: Score {score} < {SCORE_THRESHOLD_WEAK}, skipping.")
+        if score < SCORE_THRESHOLD_MODERATE:
+            logger.info(f"{symbol}: Score {score} < {SCORE_THRESHOLD_MODERATE}, skipping.")
             continue
 
         entry = get_realtime_price(symbol)
@@ -582,8 +582,8 @@ def best_intraday_signal_scan():
         macd_1h = get_macd_histogram(candles_1h)
 
         if side == "long":
-            if conf != "✅ STRONG":
-                logger.info(f"{symbol}: Not STRONG signal ({conf}), skipping.")
+            if conf not in ["✅ STRONG", "⚠️ MODERATE"]:
+                logger.info(f"{symbol}: Signal confidence {conf} not STRONG or MODERATE, skipping.")
                 continue
             if "SMC High Confidence (15m)" not in reasons:
                 logger.info(f"{symbol}: SMC High Confidence missing, skipping.")
@@ -694,8 +694,10 @@ def best_intraday_signal_scan():
             logger.info(f"{symbol}: Signal already active, skipping.")
             continue
 
+        prefix = "🚀 *STRONG* SIGNAL" if conf == "✅ STRONG" else "⚠️ *MODERATE* SIGNAL"
+
         msg = (
-            f"🚀 {symbol} *{side.upper()}* SIGNAL\n"
+            f"{prefix} {symbol} *{side.upper()}*\n"
             f"*Score:* {score}/5 {conf}\n"
             f"Entry: `{entry}` | SL: `{sl}`\n"
             f"TP1: `{tp1}` | TP2: `{tp2}` | TP3: `{tp3}` | TP4: `{tp4}`\n"
