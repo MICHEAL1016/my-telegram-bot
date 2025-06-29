@@ -530,9 +530,26 @@ def best_intraday_signal_scan():
             logger.info(f"{symbol}: Not enough candles, skipping.")
             continue
 
-        
-        if score < 3:
-            logger.info(f"{symbol}: Score {score} < 3, skipping.")
+        closes_1h = [c["close"] for c in candles_1h[-21:]]
+        closes_4h = [c["close"] for c in candles_4h[-21:]]
+        ema1h = sum(closes_1h[-20:]) / 20
+        ema4h = sum(closes_4h[-20:]) / 20
+        price_1h = closes_1h[-1]
+        price_4h = closes_4h[-1]
+
+        # Decide side BEFORE scoring
+        if price_1h > ema1h and price_4h > ema4h:
+            side = "long"
+        elif price_1h < ema1h and price_4h < ema4h:
+            side = "short"
+        else:
+            logger.info(f"{symbol}: No clear trend on 1h/4h EMA, skipping.")
+            continue
+
+        score, conf, reasons = score_signal(symbol, candles_15m, candles_1h, candles_4h, side=side)
+
+        if score < SCORE_THRESHOLD_WEAK:
+            logger.info(f"{symbol}: Score {score} < {SCORE_THRESHOLD_WEAK}, skipping.")
             continue
 
         entry = get_realtime_price(symbol)
