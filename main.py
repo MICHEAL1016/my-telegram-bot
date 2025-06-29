@@ -88,8 +88,8 @@ SIGNAL_WEIGHTS = {
     "macd": 1,
     "trend_alignment": 1
 }
-SCORE_THRESHOLD_STRONG = 4.2
-SCORE_THRESHOLD_MODERATE = 3.0
+SCORE_THRESHOLD_STRONG = 4
+SCORE_THRESHOLD_MODERATE = 2.5
 SCORE_THRESHOLD_WEAK = 1.5
 
 # ==== BOT CONFIG ====
@@ -530,7 +530,7 @@ def best_intraday_signal_scan():
             logger.info(f"{symbol}: Not enough candles, skipping.")
             continue
 
-        score, conf, reasons = score_signal(symbol, candles_15m, candles_1h, candles_4h, side=None)
+        
         if score < 3:
             logger.info(f"{symbol}: Score {score} < 3, skipping.")
             continue
@@ -556,7 +556,7 @@ def best_intraday_signal_scan():
         else:
             logger.info(f"{symbol}: No clear trend on 1h/4h EMA, skipping.")
             continue
-
+        score, conf, reasons = score_signal(symbol, candles_15m, candles_1h, candles_4h, side=side)
         recent_high = max([c["high"] for c in candles_15m[-24:]])
         recent_low = min([c["low"] for c in candles_15m[-24:]])
         last_vol = candles_15m[-1]["volume"]
@@ -871,19 +871,19 @@ def telegram_webhook():
 
 # ==== SCHEDULER & ENTRYPOINT ====
 if __name__ == "__main__":
-    if __name__ == "__main__":
-        port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 8080))
 
-        # Start WebSocket in background
-        threading.Thread(target=start_websocket, daemon=True).start()
+    # Start WebSocket in background thread
+    threading.Thread(target=start_websocket, daemon=True).start()
 
-        # Start APScheduler
-        scheduler = BackgroundScheduler()
-        scheduler.add_job(best_intraday_signal_scan, "interval", minutes=1)
-        scheduler.add_job(check_trend_shift, "interval", minutes=1)
-        scheduler.start()
-        logger.info("Scheduled main intraday scan and trend shift check.")
+    # Start scheduler jobs
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(best_intraday_signal_scan, "interval", minutes=1)
+    scheduler.add_job(check_trend_shift, "interval", minutes=1)
+    scheduler.start()
+    logger.info("Scheduled main intraday scan and trend shift check.")
 
-        # Start Flask app (main thread)
-        app.run(host="0.0.0.0", port=port)
+    # Start Flask app (main thread)
+    app.run(host="0.0.0.0", port=port)
+
 
