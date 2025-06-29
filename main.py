@@ -129,9 +129,9 @@ def send_message(text, reply_markup=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
     if reply_markup:
-        payload["reply_markup"] = json.dumps(reply_markup)
+        payload["reply_markup"] = reply_markup  # pass dict directly, no json.dumps
     try:
-        requests.post(url, data=payload, timeout=5)
+        requests.post(url, json=payload, timeout=5)  # use json=payload, NOT data=payload
     except Exception as e:
         logger.warning(f"Telegram send_message failed: {e}")
 
@@ -148,7 +148,7 @@ def answer_callback_query(callback_query_id, text=""):
     if text:
         data["text"] = text
     try:
-        requests.post(url, data=data, timeout=5)
+        requests.post(url, json=data, timeout=5)  # use json=data here too
     except Exception as e:
         logger.warning(f"Failed to answer callback: {e}")
 
