@@ -834,13 +834,7 @@ def check_trend_shift():
 from flask import Flask, request
 
 app = Flask(__name__)
-#@app.route("/sendtest")
-#def sendtest():
-    #send_test_button()
-    #return "Test button sent!"
-#@app.route("/", methods=["GET"])
-#def home():
-    #return "Bot running 🚀", 200
+
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     print("=== WEBHOOK HIT ===")
@@ -849,7 +843,9 @@ def telegram_webhook():
     # Handle normal messages
     if "message" in data:
         print("Normal message:", data["message"])
-        # You could reply here if you want to handle text commands
+        text = data["message"].get("text", "")
+        if text == "/start":
+            send_message("🤖 Bot is online! Welcome!")
 
     # Handle button clicks (callback_query)
     if "callback_query" in data:
