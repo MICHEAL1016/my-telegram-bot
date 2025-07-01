@@ -841,7 +841,7 @@ app = Flask(__name__)
 #@app.route("/", methods=["GET"])
 #def home():
     #return "Bot running 🚀", 200
-@app.route("/telegram", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     print("=== WEBHOOK HIT ===")
     data = request.get_json(force=True)
