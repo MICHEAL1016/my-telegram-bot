@@ -167,7 +167,7 @@ def send_signal_with_button(symbol, text):
             ],
         ]
     }
-    send_message(text, reply_markup=button)
+    send_message(text, CHAT_ID, reply_markup=button)
 
 # ==== File Persistence ====
 def load_strategy():
