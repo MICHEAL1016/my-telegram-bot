@@ -125,15 +125,16 @@ def send_test_button():
     print(resp.text)
 
 
-def send_message(text, reply_markup=None):
+def send_message(text, chat_id, reply_markup=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     if reply_markup:
-        payload["reply_markup"] = reply_markup  # pass dict directly, no json.dumps
+        payload["reply_markup"] = reply_markup
     try:
-        requests.post(url, json=payload, timeout=5)  # use json=payload, NOT data=payload
+        requests.post(url, json=payload, timeout=5)
     except Exception as e:
         logger.warning(f"Telegram send_message failed: {e}")
+
 
 def send_chart_image(filepath, caption=""):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
@@ -820,8 +821,10 @@ def check_trend_shift():
                 send_message(
                     f"⚠️ [TREND SHIFT] {symbol}: Trend changed for your {side.upper()}!\n"
                     f"Prev trend: {last_trend}, Now: {trend_now}\n"
-                    f"→ Consider EXIT or tighten SL immediately!"
+                    f"→ Consider EXIT or tighten SL immediately!",
+                    CHAT_ID
                 )
+
                 sdict["entered"] = False
                 sdict["tp1_hit"] = False
                 changed = True
@@ -837,15 +840,14 @@ app = Flask(__name__)
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
-    print("=== WEBHOOK HIT ===")
     data = request.get_json(force=True)
-    print("Webhook received:", data)
+
     # Handle normal messages
     if "message" in data:
-        print("Normal message:", data["message"])
         text = data["message"].get("text", "")
+        chat_id = data["message"]["chat"]["id"]
         if text == "/start":
-            send_message("🤖 Bot is online! Welcome!")
+            send_message("🤖 Bot is online! Welcome!", chat_id)
 
     # Handle button clicks (callback_query)
     if "callback_query" in data:
@@ -857,28 +859,29 @@ def telegram_webhook():
         # Always answer the callback, or the Telegram client will "spin"!
         answer_callback_query(cb_id, text=f"Button clicked: {cb_data}")
 
-        # React to button
+        # React to button, always send to `from_user`!
         if cb_data == "test_callback":
-            send_message("Test callback received!")
+            send_message("Test callback received!", from_user)
         elif cb_data.startswith("activate_"):
             symbol = cb_data.replace("activate_", "")
-            send_message(f"✅ Trade activated for {symbol}")
+            send_message(f"✅ Trade activated for {symbol}", from_user)
         elif cb_data.startswith("close_"):
             symbol = cb_data.replace("close_", "")
-            send_message(f"❌ Trade closed for {symbol}")
+            send_message(f"❌ Trade closed for {symbol}", from_user)
         elif cb_data.startswith("breakeven_"):
             symbol = cb_data.replace("breakeven_", "")
-            send_message(f"🟢 Breakeven set for {symbol}")
+            send_message(f"🟢 Breakeven set for {symbol}", from_user)
         elif cb_data.startswith("trail_"):
             symbol = cb_data.replace("trail_", "")
-            send_message(f"🟠 Trailing SL enabled for {symbol}")
+            send_message(f"🟠 Trailing SL enabled for {symbol}", from_user)
         elif cb_data.startswith("ignore_"):
             symbol = cb_data.replace("ignore_", "")
-            send_message(f"⏸ Signal ignored for {symbol}")
+            send_message(f"⏸ Signal ignored for {symbol}", from_user)
         else:
-            send_message(f"Unknown action: {cb_data}")
+            send_message(f"Unknown action: {cb_data}", from_user)
 
     return {"ok": True}, 200
+
 
 
 
