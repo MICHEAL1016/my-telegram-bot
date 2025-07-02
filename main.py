@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import requests
 import mplfinance as mpf
-
+last_signals = {}
 recent_signals = {}
 SIGNAL_COOLDOWN_SEC = 900
 
@@ -108,6 +108,16 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 logger = logging.getLogger("TradeBot")
+def load_trades():
+    try:
+        with open("trades.json") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_trades(trades):
+    with open("trades.json", "w") as f:
+        json.dump(trades, f, indent=2)
 def send_test_button():
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = {
@@ -153,7 +163,7 @@ def answer_callback_query(callback_query_id, text=""):
     except Exception as e:
         logger.warning(f"Failed to answer callback: {e}")
 
-def send_signal_with_button(symbol, text):
+def send_signal_with_button(symbol, text, signal_details=None):
     button = {
         "inline_keyboard": [
             [
@@ -168,6 +178,10 @@ def send_signal_with_button(symbol, text):
         ]
     }
     send_message(text, CHAT_ID, reply_markup=button)
+    # Store for activation on button click (add as much as you have for the trade)
+    if signal_details:
+        last_signals[symbol] = signal_details
+
 
 # ==== File Persistence ====
 def load_strategy():
@@ -323,11 +337,47 @@ def detect_reversal_candle(symbol, tf="15"):
         and c > o
         and o < prev["close"]
         and c > prev["open"]
+
     ):
         return "Bullish Engulfing"
     if lw > body * 2 and uw < body:
         return "Bullish Pin Bar"
     return None
+def activate_trade(symbol, user_id):
+    sig = last_signals.get(symbol)
+    if not sig:
+        send_message(f"⚠️ No signal data to activate for {symbol}.", user_id)
+        return
+    trades = load_trades()
+    # Don't activate if already active for this symbol/side
+    for t in trades:
+        if t["symbol"] == symbol and t.get("entered", False) and t["side"] == sig["side"]:
+            send_message(f"Trade already active for {symbol} {sig['side']}.", user_id)
+            return
+
+    trade = {
+        "symbol": symbol,
+        "side": sig["side"],
+        "entry": sig["entry"],
+        "sl": sig["sl"],
+        "tp1": sig["tp1"],
+        "tp2": sig.get("tp2"),
+        "tp3": sig.get("tp3"),
+        "tp4": sig.get("tp4"),
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "tp3_hit": False,
+        "entered": True,
+        "activated_at": time.time()
+    }
+    trades.append(trade)
+    save_trades(trades)
+    send_message(
+        f"✅ Trade activated for {symbol} {sig['side'].upper()}\n"
+        f"Entry: `{sig['entry']}` | SL: `{sig['sl']}`\n"
+        f"TP1: `{sig['tp1']}` | TP2: `{sig.get('tp2','')}` | TP3: `{sig.get('tp3','')}` | TP4: `{sig.get('tp4','')}`",
+        user_id
+    )
 
 def detect_candle_patterns(symbol, tfs=["15", "60"]):
     allowed_tfs = {"15", "60", "240"}
@@ -705,7 +755,15 @@ def best_intraday_signal_scan():
             f"ATR: {atr:.4f} | RSI: {get_rsi(candles_15m):.1f}\n"
             f"*Reasons:* " + "; ".join([r for r in reasons if r])
         )
-        send_signal_with_button(symbol, msg)
+        send_signal_with_button(symbol, msg, signal_details={
+            "side": side,
+            "entry": entry,
+            "sl": sl,
+            "tp1": tp1,
+            "tp2": tp2,
+            "tp3": tp3,
+            "tp4": tp4
+        })
         chart_path = plot_signal_chart(
             symbol, candles_15m,
             entry=entry, sl=sl,
@@ -717,34 +775,70 @@ def best_intraday_signal_scan():
         active_signals[key] = True
 
 def process_price_update(symbol, price):
-    # Load open trade status, update if SL/TP hit, and send Telegram alerts
-    strats = load_strategy()
-    sdict = strats.get(symbol)
-    if not sdict or not sdict.get("entered"):
-        return
-    side, entry, sl, tp1, tp2 = (
-        sdict["side"], sdict["entry"], sdict["sl"], sdict["tp1"], sdict["tp2"]
-    )
-    entered = sdict.get("entered", False)
-    hit1 = sdict.get("tp1_hit", False)
-    if entered and ((side == "long" and price <= sl) or (side == "short" and price >= sl)):
-        send_message(f"💥 {symbol} STOP‐LOSS @ {price}")
-        sdict["entered"] = False
-        sdict["tp1_hit"] = False
-    if (
-        entered and not hit1 and
-        ((side == "long" and price >= tp1) or (side == "short" and price <= tp1))
-    ):
-        send_message(f"🥳 {symbol} TP1 @ {price}")
-        sdict["tp1_hit"] = True
-    if (
-        entered and hit1 and
-        ((side == "long" and price >= tp2) or (side == "short" and price <= tp2))
-    ):
-        send_message(f"🏆 {symbol} TP2 @ {price}")
-        sdict["entered"] = False
-        sdict["tp1_hit"] = False
-    save_strategy(strats)
+    trades = load_trades()
+    changed = False
+    for trade in trades:
+        if trade["symbol"] != symbol or not trade.get("entered", False):
+            continue
+        side = trade["side"]
+        sl = trade["sl"]
+        tp1 = trade.get("tp1")
+        tp2 = trade.get("tp2")
+        tp3 = trade.get("tp3")
+        tp4 = trade.get("tp4")
+        tp1_hit = trade.get("tp1_hit", False)
+        tp2_hit = trade.get("tp2_hit", False)
+        tp3_hit = trade.get("tp3_hit", False)
+
+        # STOP-LOSS
+        if (side == "long" and price <= sl) or (side == "short" and price >= sl):
+            send_message(f"💥 {symbol} {side.upper()} STOP‐LOSS @ {price}", CHAT_ID)
+            trade["entered"] = False
+            changed = True
+            continue  # Trade is done
+
+        # TP1
+        if not tp1_hit and tp1 is not None and (
+            (side == "long" and price >= tp1) or (side == "short" and price <= tp1)):
+            send_message(f"🥳 {symbol} {side.upper()} TP1 @ {price}", CHAT_ID)
+            trade["tp1_hit"] = True
+            changed = True
+        # TP2
+        if trade.get("tp1_hit") and not tp2_hit and tp2 is not None and (
+            (side == "long" and price >= tp2) or (side == "short" and price <= tp2)):
+            send_message(f"🏆 {symbol} {side.upper()} TP2 @ {price}", CHAT_ID)
+            trade["tp2_hit"] = True
+            changed = True
+        # TP3
+        if trade.get("tp2_hit") and not tp3_hit and tp3 is not None and (
+            (side == "long" and price >= tp3) or (side == "short" and price <= tp3)):
+            send_message(f"🏅 {symbol} {side.upper()} TP3 @ {price}", CHAT_ID)
+            trade["tp3_hit"] = True
+            changed = True
+        # TP4 and close
+        if trade.get("tp3_hit") and tp4 is not None and (
+            (side == "long" and price >= tp4) or (side == "short" and price <= tp4)):
+            send_message(f"🎯 {symbol} {side.upper()} TP4 @ {price}\nTrade completed!", CHAT_ID)
+            trade["entered"] = False
+            changed = True
+    if changed:
+        save_trades(trades)
+def handle_trades_command(chat_id):
+    trades = load_trades()
+    open_trades = [t for t in trades if t.get("entered", False)]
+    if not open_trades:
+        send_message("No open trades at the moment.", chat_id)
+    else:
+        msg = "*Open Trades:*\n"
+        for t in open_trades:
+            msg += (f"{t['symbol']} {t['side'].upper()}\n"
+                    f"Entry: `{t['entry']}` | SL: `{t['sl']}`\n"
+                    f"TP1: `{t.get('tp1','')}` {'✅' if t.get('tp1_hit') else '❌'}\n"
+                    f"TP2: `{t.get('tp2','')}` {'✅' if t.get('tp2_hit') else '❌'}\n"
+                    f"TP3: `{t.get('tp3','')}` {'✅' if t.get('tp3_hit') else '❌'}\n"
+                    f"TP4: `{t.get('tp4','')}`\n\n")
+        send_message(msg, chat_id)
+
 
 def on_ws_open(ws):
     sub = {"op": "subscribe", "args": [f"publicTrade.{s}" for s in SYMBOLS]}
@@ -790,18 +884,19 @@ def start_websocket():
     logger.info("WebSocket started")
 def check_trend_shift():
     try:
+        logger.info("Running check_trend_shift...")
         strats = load_strategy()
         changed = False
         for symbol, sdict in strats.items():
             if not sdict.get("entered"):
+                logger.info(f"Skipping {symbol}: not entered")
                 continue
-            side = sdict.get("side", None)
-            if not side:
-                continue
+            side = sdict.get("side")
             candles_15m = get_candles(symbol, "15", 30)
             candles_1h = get_candles(symbol, "60", 30)
             candles_4h = get_candles(symbol, "240", 30)
             if len(candles_15m) < 21 or len(candles_1h) < 21 or len(candles_4h) < 21:
+                logger.info(f"Skipping {symbol}: not enough candles")
                 continue
             ema15 = sum([c["close"] for c in candles_15m[-20:]]) / 20
             ema1h = sum([c["close"] for c in candles_1h[-20:]]) / 20
@@ -809,22 +904,28 @@ def check_trend_shift():
             price15 = candles_15m[-1]["close"]
             price1h = candles_1h[-1]["close"]
             price4h = candles_4h[-1]["close"]
+
             if price15 > ema15 and price1h > ema1h and price4h > ema4h:
                 trend_now = "long"
             elif price15 < ema15 and price1h < ema1h and price4h < ema4h:
                 trend_now = "short"
             else:
                 trend_now = "neutral"
+
             last_trend = sdict.get("last_trend", None)
-            if (side == "long" and trend_now != "long") or \
-               (side == "short" and trend_now != "short"):
+            logger.info(f"{symbol} entered:{sdict.get('entered')} side:{side} last_trend:{last_trend} → now:{trend_now}")
+
+            # Only trigger alert if trade is active and trend has shifted away from side
+            if last_trend is None:
+                sdict["last_trend"] = trend_now
+                changed = True
+                continue
+            if (side == "long" and trend_now != "long") or (side == "short" and trend_now != "short"):
+                logger.warning(f"[TREND SHIFT] {symbol} {side.upper()} | last:{last_trend} now:{trend_now}")
                 send_message(
-                    f"⚠️ [TREND SHIFT] {symbol}: Trend changed for your {side.upper()}!\n"
-                    f"Prev trend: {last_trend}, Now: {trend_now}\n"
-                    f"→ Consider EXIT or tighten SL immediately!",
+                    f"⚠️ [TREND SHIFT] {symbol}: Trend changed for your {side.upper()}!\nPrev trend: {last_trend}, Now: {trend_now}\n→ Consider EXIT or tighten SL immediately!",
                     CHAT_ID
                 )
-
                 sdict["entered"] = False
                 sdict["tp1_hit"] = False
                 changed = True
@@ -833,10 +934,39 @@ def check_trend_shift():
         if changed:
             save_strategy(strats)
     except Exception as e:
-        logger.exception(f"Error in check_trend_shift main: {e}")
+        logger.exception(f"Error in check_trend_shift: {e}")
+
 from flask import Flask, request
 
 app = Flask(__name__)
+def handle_history_command(chat_id):
+    trades = load_trades()
+    closed_trades = [t for t in trades if not t.get("entered", False)]
+    if not closed_trades:
+        send_message("No closed trades yet.", chat_id)
+    else:
+        msg = "*Closed Trades:*\n"
+        for t in closed_trades[-10:]:  # show last 10
+            exit_status = "TP4" if t.get("tp3_hit") else \
+                          "TP3" if t.get("tp2_hit") else \
+                          "TP2" if t.get("tp1_hit") else "SL/Manual"
+            pnl = "N/A"
+            try:
+                entry = float(t['entry'])
+                exit = float(
+                    t.get('tp4') if exit_status == "TP4" else
+                    t.get('tp3') if exit_status == "TP3" else
+                    t.get('tp2') if exit_status == "TP2" else
+                    t.get('sl')
+                )
+                pnl = f"{((exit - entry)/entry*100):.2f}%"
+                if t['side'] == "short":
+                    pnl = f"{((entry - exit)/entry*100):.2f}%"
+            except:
+                pass
+            msg += (f"{t['symbol']} {t['side'].upper()} | Entry: `{t['entry']}` | "
+                    f"Exit: `{exit_status}` | PnL: {pnl}\n")
+        send_message(msg, chat_id)
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
@@ -848,6 +978,10 @@ def telegram_webhook():
         chat_id = data["message"]["chat"]["id"]
         if text == "/start":
             send_message("🤖 Bot is online! Welcome!", chat_id)
+        elif text in ("/trades", "/status"):
+            handle_trades_command(chat_id)
+        elif text == "/history":
+            handle_history_command(chat_id)
 
     # Handle button clicks (callback_query)
     if "callback_query" in data:
@@ -863,14 +997,17 @@ def telegram_webhook():
         if cb_data == "test_callback":
             send_message("Test callback received!", from_user)
         elif cb_data.startswith("activate_"):
-            symbol = cb_data.replace("activate_", "")
-            send_message(f"✅ Trade activated for {symbol}", from_user)
+             symbol = cb_data.replace("activate_", "")
+             activate_trade(symbol, from_user)   # <--- CALL THE ACTUAL FUNCTION!
+
         elif cb_data.startswith("close_"):
             symbol = cb_data.replace("close_", "")
             send_message(f"❌ Trade closed for {symbol}", from_user)
+
         elif cb_data.startswith("breakeven_"):
             symbol = cb_data.replace("breakeven_", "")
             send_message(f"🟢 Breakeven set for {symbol}", from_user)
+
         elif cb_data.startswith("trail_"):
             symbol = cb_data.replace("trail_", "")
             send_message(f"🟠 Trailing SL enabled for {symbol}", from_user)
@@ -879,6 +1016,7 @@ def telegram_webhook():
             send_message(f"⏸ Signal ignored for {symbol}", from_user)
         else:
             send_message(f"Unknown action: {cb_data}", from_user)
+
 
     return {"ok": True}, 200
 
