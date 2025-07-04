@@ -909,6 +909,23 @@ def handle_trades_command(chat_id):
             if t.get("trail"): flags.append("🟠 Trail")
             if t.get("ignored"): flags.append("⏸ Ignored")
             state = " | ".join(flags) if flags else ""
+
+            # Live PnL calc
+            try:
+                entry = float(t['entry'])
+                side = t['side']
+                cur_price = get_realtime_price(t['symbol'])
+                if cur_price:
+                    if side == "long":
+                        pnl = (cur_price - entry) / entry * 100
+                    else:
+                        pnl = (entry - cur_price) / entry * 100
+                    pnl_str = f"{pnl:+.2f}%"
+                else:
+                    pnl_str = "N/A"
+            except Exception:
+                pnl_str = "N/A"
+
             msg += (
                 f"{t['symbol']} {t['side'].upper()} {state}\n"
                 f"Entry: `{t['entry']}` | SL: `{t['sl']}`\n"
@@ -916,9 +933,12 @@ def handle_trades_command(chat_id):
                 f"TP2: `{t.get('tp2','')}` {'✅' if t.get('tp2_hit') else '❌'}\n"
                 f"TP3: `{t.get('tp3','')}` {'✅' if t.get('tp3_hit') else '❌'}\n"
                 f"TP4: `{t.get('tp4','')}`\n"
+                f"Live PnL: *{pnl_str}*\n"
                 "\n"
             )
         send_message(msg, chat_id)
+
+
 
 
 def on_ws_open(ws):
@@ -1035,17 +1055,14 @@ def handle_history_command(chat_id):
             close_time = format_time(close_time_raw)
             try:
                 entry = float(t['entry'])
-                exit = float(
-                    t.get('tp4') if exit_status == "TP4" else
-                    t.get('tp3') if exit_status == "TP3" else
-                    t.get('tp2') if exit_status == "TP2" else
-                    t.get('sl')
-                )
-                pnl = f"{((exit - entry)/entry*100):.2f}%"
+                close_price = float(t.get('close_price', entry))  # Use the recorded close price, fallback to entry if not present
                 if t['side'] == "short":
-                    pnl = f"{((entry - exit)/entry*100):.2f}%"
+                    pnl = f"{((entry - close_price) / entry * 100):.2f}%"
+                else:
+                    pnl = f"{((close_price - entry) / entry * 100):.2f}%"
             except:
-                pass
+                pnl = "N/A"
+
             # Add state/flags if present
             flags = []
             if t.get("breakeven"): flags.append("🟢 BE")
