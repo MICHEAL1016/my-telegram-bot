@@ -989,9 +989,12 @@ def check_trend_shift():
         strats = load_strategy()
         changed = False
         for symbol, sdict in strats.items():
+            # --- Extra logging for all trades ---
+            logger.info(f"{symbol}: entered={sdict.get('entered')}, side={sdict.get('side')}, last_trend={sdict.get('last_trend')}")
+
             if not sdict.get("entered"):
-                logger.info(f"Skipping {symbol}: not entered")
                 continue
+
             side = sdict.get("side")
             candles_15m = get_candles(symbol, "15", 30)
             candles_1h = get_candles(symbol, "60", 30)
@@ -999,6 +1002,8 @@ def check_trend_shift():
             if len(candles_15m) < 21 or len(candles_1h) < 21 or len(candles_4h) < 21:
                 logger.info(f"Skipping {symbol}: not enough candles")
                 continue
+
+            # Calculate EMAs and price
             ema15 = sum([c["close"] for c in candles_15m[-20:]]) / 20
             ema1h = sum([c["close"] for c in candles_1h[-20:]]) / 20
             ema4h = sum([c["close"] for c in candles_4h[-20:]]) / 20
@@ -1006,36 +1011,48 @@ def check_trend_shift():
             price1h = candles_1h[-1]["close"]
             price4h = candles_4h[-1]["close"]
 
-            if price15 > ema15 and price1h > ema1h and price4h > ema4h:
+            # --- Flexible trend detection: 2 out of 3 TF must agree ---
+            up = sum([price15 > ema15, price1h > ema1h, price4h > ema4h])
+            down = sum([price15 < ema15, price1h < ema1h, price4h < ema4h])
+
+            if up >= 2:
                 trend_now = "long"
-            elif price15 < ema15 and price1h < ema1h and price4h < ema4h:
+            elif down >= 2:
                 trend_now = "short"
             else:
                 trend_now = "neutral"
 
             last_trend = sdict.get("last_trend", None)
-            logger.info(f"{symbol} entered:{sdict.get('entered')} side:{side} last_trend:{last_trend} → now:{trend_now}")
+            logger.info(f"{symbol}: SIDE={side} LAST_TREND={last_trend} NOW={trend_now} ENTERED={sdict.get('entered')}")
 
-            # Only trigger alert if trade is active and trend has shifted away from side
+            # --- Alert if trend shifts away from trade direction ---
             if last_trend is None:
+                logger.info(f"{symbol}: Initializing last_trend to {trend_now}")
                 sdict["last_trend"] = trend_now
                 changed = True
                 continue
+
             if (side == "long" and trend_now != "long") or (side == "short" and trend_now != "short"):
                 logger.warning(f"[TREND SHIFT] {symbol} {side.upper()} | last:{last_trend} now:{trend_now}")
                 send_message(
-                    f"⚠️ [TREND SHIFT] {symbol}: Trend changed for your {side.upper()}!\nPrev trend: {last_trend}, Now: {trend_now}\n→ Consider EXIT or tighten SL immediately!",
+                    f"⚠️ [TREND SHIFT] {symbol}: Trend changed for your {side.upper()}!\n"
+                    f"Prev trend: {last_trend}, Now: {trend_now}\n"
+                    f"→ Consider EXIT or tighten SL immediately!",
                     CHAT_ID
                 )
+                # Auto-disable trade if you want (remove below if you want only alerts)
                 sdict["entered"] = False
                 sdict["tp1_hit"] = False
                 changed = True
+
             sdict["last_trend"] = trend_now
             strats[symbol] = sdict
+
         if changed:
             save_strategy(strats)
     except Exception as e:
         logger.exception(f"Error in check_trend_shift: {e}")
+
 
 app = Flask(__name__)
 def handle_history_command(chat_id):
@@ -1077,6 +1094,55 @@ def handle_history_command(chat_id):
             )
         send_message(msg, chat_id)
 
+def send_daily_stats():
+    trades = load_trades()
+    today = datetime.now().date()
+    day_trades = [t for t in trades if t.get("close_time") and datetime.fromtimestamp(t["close_time"]).date() == today]
+    if not day_trades:
+        send_message("No closed trades today.", CHAT_ID)
+        return
+
+    win = 0
+    loss = 0
+    total_pnl = 0
+    for t in day_trades:
+        try:
+            entry = float(t['entry'])
+            exit_status = "SL/Manual"
+            close_price = float(t.get("close_price", 0))
+            if t.get("tp3_hit"):
+                exit_status = "TP3"
+                pnl = ((float(t.get('tp3')) - entry) / entry) * 100 if t['side'] == "long" else ((entry - float(t.get('tp3'))) / entry) * 100
+                win += 1
+            elif t.get("tp2_hit"):
+                exit_status = "TP2"
+                pnl = ((float(t.get('tp2')) - entry) / entry) * 100 if t['side'] == "long" else ((entry - float(t.get('tp2'))) / entry) * 100
+                win += 1
+            elif t.get("tp1_hit"):
+                exit_status = "TP1"
+                pnl = ((float(t.get('tp1')) - entry) / entry) * 100 if t['side'] == "long" else ((entry - float(t.get('tp1'))) / entry) * 100
+                win += 1
+            else:
+                pnl = ((close_price - entry) / entry) * 100 if t['side'] == "long" else ((entry - close_price) / entry) * 100
+                loss += 1
+            total_pnl += pnl
+        except:
+            pass
+
+    total = win + loss
+    winrate = (win / total) * 100 if total else 0
+
+    msg = (
+        f"📊 *Daily Trade Stats*\n"
+        f"Date: {today}\n"
+        f"Trades: {total}\n"
+        f"Wins: {win}\n"
+        f"Losses: {loss}\n"
+        f"Winrate: {winrate:.1f}%\n"
+        f"Total PnL: {total_pnl:+.2f}%\n"
+    )
+    send_message(msg, CHAT_ID)
+
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
@@ -1092,6 +1158,8 @@ def telegram_webhook():
             handle_trades_command(chat_id)
         elif text == "/history":
             handle_history_command(chat_id)
+        elif text == "/stats":
+            send_daily_stats()
 
     # Handle button clicks (callback_query)
     if "callback_query" in data:
@@ -1164,6 +1232,9 @@ if __name__ == "__main__":
     scheduler = BackgroundScheduler()
     scheduler.add_job(best_intraday_signal_scan, "interval", minutes=1)
     scheduler.add_job(check_trend_shift, "interval", minutes=1)
+    # --- Add scheduler job ---
+    scheduler.add_job(send_daily_stats, "cron", hour=23, minute=0)  # Sends at 23:00 every day
+
     scheduler.start()
     logger.info("Scheduled main intraday scan and trend shift check.")
 
