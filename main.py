@@ -1320,9 +1320,12 @@ def get_live_trade_advice(symbol, side, entry, sl, tp1, tp2, tp3, tp4):
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     data = request.get_json(force=True)
+
+    # ---- Handle normal messages (ONE block only) ----
     if "message" in data:
         text = data["message"].get("text", "")
         chat_id = data["message"]["chat"]["id"]
+
         if text == "/start":
             send_message("🤖 Bot is online! Welcome!", chat_id)
         elif text in ("/trades", "/status"):
@@ -1343,21 +1346,9 @@ def telegram_webhook():
             else:
                 mode = "STRICT" if STRICT_MODE else "LOOSE"
                 send_message(f"Current mode: *{mode}*\nUsage: /strictmode on  or  /strictmode off", chat_id)
-            return  # prevent double response
-    # Handle normal messages
-    if "message" in data:
-        text = data["message"].get("text", "")
-        chat_id = data["message"]["chat"]["id"]
-        if text == "/start":
-            send_message("🤖 Bot is online! Welcome!", chat_id)
-        elif text in ("/trades", "/status"):
-            handle_trades_command(chat_id)
-        elif text == "/history":
-            handle_history_command(chat_id)
-        elif text == "/stats":
-            send_daily_stats()
+            return  # <--- super important! Prevents double response
 
-    # Handle button clicks (callback_query)
+    # ---- Handle button clicks (callback_query) ----
     if "callback_query" in data:
         callback = data["callback_query"]
         cb_id = callback["id"]
@@ -1374,7 +1365,7 @@ def telegram_webhook():
             symbol = cb_data.replace("activate_", "")
             activate_trade(symbol, from_user)
 
-            # Load the newly activated trade
+            # Show advice for the just-activated trade
             trades = load_trades()
             t = next((x for x in trades if x["symbol"] == symbol and x.get("entered", False)), None)
             if t:
@@ -1435,6 +1426,7 @@ def telegram_webhook():
             send_message(f"Unknown action: {cb_data}", from_user)
 
     return {"ok": True}, 200
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
