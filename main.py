@@ -21,12 +21,14 @@ import mplfinance as mpf
 last_signals = {}
 recent_signals = {}
 SIGNAL_COOLDOWN_SEC = 900
-
+SL_COUNTER_FILE = "sl_counters.json"
 from flask import Flask, request
 from apscheduler.schedulers.background import BackgroundScheduler
 from websocket import WebSocketApp
-
-
+from datetime import datetime
+BLACKLIST_FILE = "blacklist.json"
+BLACKLIST_COOLDOWN = 3 * 60 * 60  # 3 hours
+BLACKLIST_SL_LIMIT = 2
 # ==== COIN SETTINGS ====
 COIN_SETTINGS = {
     "BTCUSDT":  {"MIN_RR": 2.5, "MAX_RR": 3.5, "MIN_SL_PCT": 0.004, "MIN_TP_PCT": 0.014},
@@ -108,12 +110,6 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 logger = logging.getLogger("TradeBot")
-def load_trades():
-    try:
-        with open("trades.json") as f:
-            return json.load(f)
-    except Exception:
-        return []
 
 def save_trades(trades):
     with open("trades.json", "w") as f:
@@ -133,8 +129,122 @@ def send_test_button():
     }
     resp = requests.post(url, data=data)
     print(resp.text)
+def load_sl_counters():
+    try:
+        with open(SL_COUNTER_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
+def save_sl_counters(counters):
+    with open(SL_COUNTER_FILE, "w") as f:
+        json.dump(counters, f, indent=2)
+def handle_stop_loss(symbol):
+    counters = load_sl_counters()
+    counters[symbol] = counters.get(symbol, 0) + 1
+    save_sl_counters(counters)
 
+    # If SL limit hit, blacklist
+    if counters[symbol] >= BLACKLIST_SL_LIMIT:
+        blacklist_symbol(symbol)
+        counters[symbol] = 0   # Reset after blacklisting
+        save_sl_counters(counters)
+
+def format_time(ts):
+    """Convert Unix timestamp to readable time."""
+    if not ts:
+        return ""
+    try:
+        return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(ts)
+def load_blacklist():
+    try:
+        with open(BLACKLIST_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_blacklist(bl):
+    with open(BLACKLIST_FILE, "w") as f:
+        json.dump(bl, f, indent=2)
+
+def is_blacklisted(symbol):
+    bl = load_blacklist()
+    ts = bl.get(symbol, 0)
+    if time.time() < ts:
+        return True
+    return False
+
+def update_blacklist_on_sl(symbol):
+    trades = load_trades()
+    # Last 5 closed trades for this symbol, count SLs
+    sl_count = 0
+    for t in reversed(trades):
+        if t["symbol"] != symbol or t.get("entered", True):
+            continue
+        # Assume exit status is "SL" or manual close (not TPX)
+        if "sl" in str(t.get("close_price", "")).lower() or t.get("exit_status", "") == "SL/Manual":
+            sl_count += 1
+        if sl_count >= BLACKLIST_SL_LIMIT:
+            blacklist_symbol(symbol)
+            logger.warning(f"{symbol} auto-blacklisted for {BLACKLIST_COOLDOWN/3600:.1f}h due to consecutive SLs.")
+            return
+
+# Call update_blacklist_on_sl(symbol) in your process_price_update STOP-LOSS logic, after each SL
+
+# -------------- Order Block (OB) Detection --------------
+def send_blacklist_alert(symbol, cooldown=BLACKLIST_COOLDOWN):
+    hours = int(cooldown // 3600)
+    minutes = int((cooldown % 3600) // 60)
+    msg = (
+        f"🚫 *{symbol}* auto-blacklisted after 2 consecutive SL hits.\n"
+        f"No new signals will be sent for this coin for the next "
+        f"{hours}h {minutes}m to protect your account."
+    )
+    send_message(msg, CHAT_ID)
+def blacklist_symbol(symbol):
+    # Load blacklist state
+    try:
+        with open(BLACKLIST_FILE) as f:
+            bl = json.load(f)
+    except Exception:
+        bl = {}
+    bl[symbol] = int(time.time()) + BLACKLIST_COOLDOWN
+    with open(BLACKLIST_FILE, "w") as f:
+        json.dump(bl, f)
+    send_blacklist_alert(symbol)  # <-- Telegram alert!
+
+def detect_order_blocks(candles, side="long"):
+    """
+    Return a list of order block price levels from recent price action.
+    For longs: find last swing down candle (big red) with volume spike and close near low (bullish OB)
+    For shorts: last swing up candle (big green) with volume spike and close near high (bearish OB)
+    """
+    obs = []
+    for i in range(len(candles)-6, len(candles)-1):  # last 5 candles
+        c = candles[i]
+        rng = c["high"] - c["low"]
+        vol = c["volume"]
+        # Heuristic: Order block = big candle, high volume, closes near wick extreme
+        if side == "long" and c["close"] < c["open"] and (c["close"]-c["low"] < rng*0.25) and vol > np.mean([k["volume"] for k in candles[i-6:i+1]])*1.2:
+            obs.append(c["low"])
+        if side == "short" and c["close"] > c["open"] and (c["high"]-c["close"] < rng*0.25) and vol > np.mean([k["volume"] for k in candles[i-6:i+1]])*1.2:
+            obs.append(c["high"])
+    # Deduplicate, keep only unique, sorted
+    return sorted(list(set(obs)))
+
+# -------------- Retest Logic --------------
+def is_retest(entry, ob_levels, side, tolerance=0.002):
+    """
+    Return True if entry is a retest (within tolerance%) of an order block zone
+    """
+    for ob in ob_levels:
+        if side == "long" and abs(entry - ob) / entry <= tolerance:
+            return True
+        if side == "short" and abs(entry - ob) / entry <= tolerance:
+            return True
+    return False
 def send_message(text, chat_id, reply_markup=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
@@ -201,11 +311,6 @@ def load_trades():
             return json.load(f)
     except FileNotFoundError:
         return []
-
-def save_trades(trades):
-    with open(TRADES_FILE, "w") as f:
-        json.dump(trades, f, indent=2)
-
 # ==== API Calls ====
 def safe_request(method, url, **kwargs):
     delay = 1
@@ -568,6 +673,10 @@ def plot_signal_chart(symbol, candles, entry=None, sl=None, tp1=None, tp2=None, 
 def best_intraday_signal_scan():
     strats = load_strategy()
     for symbol in SYMBOLS:
+        if is_blacklisted(symbol):
+            logger.info(f"{symbol}: Blacklisted, skipping signal scan.")
+            continue
+
         cs = COIN_SETTINGS.get(symbol, COIN_SETTINGS['default'])
         min_rr = cs['MIN_RR']
         max_rr = cs['MAX_RR']
@@ -588,7 +697,7 @@ def best_intraday_signal_scan():
         price_1h = closes_1h[-1]
         price_4h = closes_4h[-1]
 
-        # Decide side BEFORE scoring
+        # ----------- TREND AGREEMENT -----------
         if price_1h > ema1h and price_4h > ema4h:
             side = "long"
         elif price_1h < ema1h and price_4h < ema4h:
@@ -597,10 +706,13 @@ def best_intraday_signal_scan():
             logger.info(f"{symbol}: No clear trend on 1h/4h EMA, skipping.")
             continue
 
+        # ----------- SCORE + SMC -----------
         score, conf, reasons = score_signal(symbol, candles_15m, candles_1h, candles_4h, side=side)
-
         if score < SCORE_THRESHOLD_MODERATE:
             logger.info(f"{symbol}: Score {score} < {SCORE_THRESHOLD_MODERATE}, skipping.")
+            continue
+        if "SMC High Confidence (15m)" not in reasons:
+            logger.info(f"{symbol}: SMC High Confidence missing, skipping.")
             continue
 
         entry = get_realtime_price(symbol)
@@ -608,133 +720,91 @@ def best_intraday_signal_scan():
             logger.info(f"{symbol}: No real-time price, skipping.")
             continue
 
-        # ==== STRICT HIGH-CONVICTION FILTER BLOCK ====
-        closes_1h = [c["close"] for c in candles_1h[-21:]]
-        closes_4h = [c["close"] for c in candles_4h[-21:]]
-        ema1h = sum(closes_1h[-20:]) / 20
-        ema4h = sum(closes_4h[-20:]) / 20
-        price_1h = closes_1h[-1]
-        price_4h = closes_4h[-1]
-
-        # Decide side
-        if price_1h > ema1h and price_4h > ema4h:
-            side = "long"
-        elif price_1h < ema1h and price_4h < ema4h:
-            side = "short"
-        else:
-            logger.info(f"{symbol}: No clear trend on 1h/4h EMA, skipping.")
+        # ----------- ORDER BLOCK + RETEST ENFORCEMENT -----------
+        ob_levels = detect_order_blocks(candles_15m, side=side)
+        if not ob_levels:
+            logger.info(f"{symbol}: No recent OB detected, skipping.")
             continue
-        score, conf, reasons = score_signal(symbol, candles_15m, candles_1h, candles_4h, side=side)
-        recent_high = max([c["high"] for c in candles_15m[-24:]])
-        recent_low = min([c["low"] for c in candles_15m[-24:]])
+        if not is_retest(entry, ob_levels, side, tolerance=0.003):
+            logger.info(f"{symbol}: Entry is NOT a retest of OB, skipping.")
+            continue
+
+        # ----------- VOLUME SPIKE -----------
         last_vol = candles_15m[-1]["volume"]
         avg_vol = sum([c["volume"] for c in candles_15m[-10:]]) / 10
+        if last_vol <= 1.2 * avg_vol:
+            logger.info(f"{symbol}: Volume spike not strong enough (last_vol={last_vol}, avg_vol={avg_vol}), skipping.")
+            continue
+
+        # ----------- MACD -----------
         macd_15 = get_macd_histogram(candles_15m)
         macd_1h = get_macd_histogram(candles_1h)
+        if side == "long" and (macd_15 <= 0 or macd_1h <= 0):
+            logger.info(f"{symbol}: MACD not both positive, skipping.")
+            continue
+        if side == "short" and (macd_15 >= 0 or macd_1h >= 0):
+            logger.info(f"{symbol}: MACD not both negative, skipping.")
+            continue
 
-        if side == "long":
-            if conf not in ["✅ STRONG", "⚠️ MODERATE"]:
-                logger.info(f"{symbol}: Signal confidence {conf} not STRONG or MODERATE, skipping.")
-                continue
-            if "SMC High Confidence (15m)" not in reasons:
-                logger.info(f"{symbol}: SMC High Confidence missing, skipping.")
-                continue
-            if last_vol <= 1.3 * avg_vol:
-                logger.info(f"{symbol}: Volume spike not strong enough (last_vol={last_vol}, avg_vol={avg_vol}), skipping.")
-                continue
-            if entry <= recent_high:
-                logger.info(f"{symbol}: Not breaking recent high ({entry} <= {recent_high}), skipping.")
-                continue
-            if macd_15 <= 0 or macd_1h <= 0:
-                logger.info(f"{symbol}: MACD not both positive (15m={macd_15}, 1h={macd_1h}), skipping.")
-                continue
-            if not (price_1h > ema1h and price_4h > ema4h):
-                logger.info(f"{symbol}: Not above EMA on 1h/4h (price_1h={price_1h}, ema1h={ema1h}, price_4h={price_4h}, ema4h={ema4h}), skipping.")
-                continue
+        # ----------- BREAKOUT FILTER -----------
+        recent_high = max([c["high"] for c in candles_15m[-24:]])
+        recent_low = min([c["low"] for c in candles_15m[-24:]])
+        if side == "long" and entry <= recent_high:
+            logger.info(f"{symbol}: Not breaking recent high ({entry} <= {recent_high}), skipping.")
+            continue
+        if side == "short" and entry >= recent_low:
+            logger.info(f"{symbol}: Not breaking recent low ({entry} >= {recent_low}), skipping.")
+            continue
 
-        if side == "short":
-            if conf != "✅ STRONG":
-                logger.info(f"{symbol}: Not STRONG signal ({conf}), skipping.")
-                continue
-            if "SMC High Confidence (15m)" not in reasons:
-                logger.info(f"{symbol}: SMC High Confidence missing, skipping.")
-                continue
-            if last_vol <= 1.3 * avg_vol:
-                logger.info(f"{symbol}: Volume spike not strong enough (last_vol={last_vol}, avg_vol={avg_vol}), skipping.")
-                continue
-            if entry >= recent_low:
-                logger.info(f"{symbol}: Not breaking recent low ({entry} >= {recent_low}), skipping.")
-                continue
-            if macd_15 >= 0 or macd_1h >= 0:
-                logger.info(f"{symbol}: MACD not both negative (15m={macd_15}, 1h={macd_1h}), skipping.")
-                continue
-            if not (price_1h < ema1h and price_4h < ema4h):
-                logger.info(f"{symbol}: Not below EMA on 1h/4h (price_1h={price_1h}, ema1h={ema1h}, price_4h={price_4h}, ema4h={ema4h}), skipping.")
-                continue
-        # ==== END STRICT FILTER BLOCK ====
-
+        # ----------- STOP-LOSS (structure-based with buffer) -----------
         atr = calculate_atr(candles_15m, 14)
-        structure_lookback = 20
-
+        lookback = 20
+        buffer = max(entry * 0.001, atr * 0.18)
         if side == "long":
-            swing_low = min(c["low"] for c in candles_15m[-structure_lookback:])
-            sl_struct = swing_low
-            sl_atr = entry - atr * 1.7
-            sl_candidate = min(sl_struct, sl_atr)
+            swing_low = min(c["low"] for c in candles_15m[-lookback:])
+            sl_candidate = swing_low - buffer
+            recent_lows = [c["low"] for c in candles_15m[-3:]]
+            sl_final = min(sl_candidate, min(recent_lows) - buffer)
             min_sl = entry * (1 - min_sl_pct)
-            if sl_candidate < min_sl:
-                sl = round(min_sl, 6)
-                logger.info(f"{symbol}: SL moved up to min_sl_pct ({sl})")
-            else:
-                sl = round(sl_candidate, 6)
+            sl = round(max(sl_final, min_sl), 6)
             risk = entry - sl
             if risk < max(entry * 0.002, 1.2 * atr):
                 logger.info(f"{symbol}: Risk too small (risk={risk}, entry={entry}, atr={atr}), skipping.")
                 continue
-            tp1 = round(entry + risk * min_rr, 6)
-            tp2 = round(entry + risk * max_rr, 6)
-            min_tp = entry * (1 + min_tp_pct)
-            if tp1 < min_tp:
-                tp1 = round(min_tp, 6)
-            if tp2 < tp1 + atr:
-                tp2 = round(tp1 + atr, 6)
-            resistances = sorted(set(c["high"] for c in candles_15m), reverse=False)
-            tp3 = next((r for r in resistances if r > tp2), round(tp2 + atr, 6))
-            tp4 = next((r for r in resistances if r > tp3), round(tp3 + atr, 6))
         else:
-            swing_high = max(c["high"] for c in candles_15m[-structure_lookback:])
-            sl_struct = swing_high
-            sl_atr = entry + atr * 1.7
-            sl_candidate = max(sl_struct, sl_atr)
+            swing_high = max(c["high"] for c in candles_15m[-lookback:])
+            sl_candidate = swing_high + buffer
+            recent_highs = [c["high"] for c in candles_15m[-3:]]
+            sl_final = max(sl_candidate, max(recent_highs) + buffer)
             max_sl = entry * (1 + min_sl_pct)
-            if sl_candidate > max_sl:
-                sl = round(max_sl, 6)
-                logger.info(f"{symbol}: SL moved down to max_sl_pct ({sl})")
-            else:
-                sl = round(sl_candidate, 6)
+            sl = round(min(sl_final, max_sl), 6)
             risk = sl - entry
             if risk < max(entry * 0.002, 1.2 * atr):
                 logger.info(f"{symbol}: Risk too small (risk={risk}, entry={entry}, atr={atr}), skipping.")
                 continue
+
+        # ----------- TP1, TP2, TP3, TP4 -----------
+        if side == "long":
+            tp1 = round(entry + risk * min_rr, 6)
+            tp2 = round(entry + risk * max_rr, 6)
+            resistances = sorted(set(c["high"] for c in candles_15m if c["high"] > tp2))
+            tp3 = round(resistances[0], 6) if resistances else round(tp2 + atr, 6)
+            tp4 = round(resistances[1], 6) if len(resistances) > 1 else round(tp3 + atr, 6)
+        else:
             tp1 = round(entry - risk * min_rr, 6)
             tp2 = round(entry - risk * max_rr, 6)
-            min_tp = entry * (1 - min_tp_pct)
-            if tp1 > min_tp:
-                tp1 = round(min_tp, 6)
-            if tp2 > tp1 - atr:
-                tp2 = round(tp1 - atr, 6)
-            supports = sorted(set(c["low"] for c in candles_15m), reverse=True)
-            tp3 = next((s for s in supports if s < tp2), round(tp2 - atr, 6))
-            tp4 = next((s for s in supports if s < tp3), round(tp3 - atr, 6))
+            supports = sorted(set(c["low"] for c in candles_15m if c["low"] < tp2), reverse=True)
+            tp3 = round(supports[0], 6) if supports else round(tp2 - atr, 6)
+            tp4 = round(supports[1], 6) if len(supports) > 1 else round(tp3 - atr, 6)
 
+        # --- Duplicate/cooldown and activation logic here (unchanged) ---
         key = f"{symbol}_{side}"
-        # --- Duplicate/cooldown filter ---
         rec_key = (symbol, side)
         now = time.time()
         prev = recent_signals.get(rec_key, {})
         is_same_signal = (
             prev and
-            abs(prev.get("entry", 0) - entry) < 1e-4 and  # tiny float tolerance
+            abs(prev.get("entry", 0) - entry) < 1e-4 and
             prev.get("score") == score and
             (now - prev.get("ts", 0)) < SIGNAL_COOLDOWN_SEC
         )
@@ -746,7 +816,6 @@ def best_intraday_signal_scan():
             continue
 
         prefix = "🚀 *STRONG* SIGNAL" if conf == "✅ STRONG" else "⚠️ *MODERATE* SIGNAL"
-
         msg = (
             f"{prefix} {symbol} *{side.upper()}*\n"
             f"*Score:* {score}/5 {conf}\n"
@@ -773,6 +842,10 @@ def best_intraday_signal_scan():
         if chart_path:
             send_chart_image(chart_path, caption=f"{symbol} Signal Chart")
         active_signals[key] = True
+
+# Call this update_blacklist_on_sl(symbol) in your process_price_update after SL
+# Example (in your process_price_update, after setting entered=False for an SL):
+#    update_blacklist_on_sl(symbol)
 
 def process_price_update(symbol, price):
     trades = load_trades()
@@ -831,12 +904,20 @@ def handle_trades_command(chat_id):
     else:
         msg = "*Open Trades:*\n"
         for t in open_trades:
-            msg += (f"{t['symbol']} {t['side'].upper()}\n"
-                    f"Entry: `{t['entry']}` | SL: `{t['sl']}`\n"
-                    f"TP1: `{t.get('tp1','')}` {'✅' if t.get('tp1_hit') else '❌'}\n"
-                    f"TP2: `{t.get('tp2','')}` {'✅' if t.get('tp2_hit') else '❌'}\n"
-                    f"TP3: `{t.get('tp3','')}` {'✅' if t.get('tp3_hit') else '❌'}\n"
-                    f"TP4: `{t.get('tp4','')}`\n\n")
+            flags = []
+            if t.get("breakeven"): flags.append("🟢 BE")
+            if t.get("trail"): flags.append("🟠 Trail")
+            if t.get("ignored"): flags.append("⏸ Ignored")
+            state = " | ".join(flags) if flags else ""
+            msg += (
+                f"{t['symbol']} {t['side'].upper()} {state}\n"
+                f"Entry: `{t['entry']}` | SL: `{t['sl']}`\n"
+                f"TP1: `{t.get('tp1','')}` {'✅' if t.get('tp1_hit') else '❌'}\n"
+                f"TP2: `{t.get('tp2','')}` {'✅' if t.get('tp2_hit') else '❌'}\n"
+                f"TP3: `{t.get('tp3','')}` {'✅' if t.get('tp3_hit') else '❌'}\n"
+                f"TP4: `{t.get('tp4','')}`\n"
+                "\n"
+            )
         send_message(msg, chat_id)
 
 
@@ -936,8 +1017,6 @@ def check_trend_shift():
     except Exception as e:
         logger.exception(f"Error in check_trend_shift: {e}")
 
-from flask import Flask, request
-
 app = Flask(__name__)
 def handle_history_command(chat_id):
     trades = load_trades()
@@ -951,6 +1030,9 @@ def handle_history_command(chat_id):
                           "TP3" if t.get("tp2_hit") else \
                           "TP2" if t.get("tp1_hit") else "SL/Manual"
             pnl = "N/A"
+            close_price = t.get("close_price", "N/A")
+            close_time_raw = t.get("close_time")
+            close_time = format_time(close_time_raw)
             try:
                 entry = float(t['entry'])
                 exit = float(
@@ -964,9 +1046,20 @@ def handle_history_command(chat_id):
                     pnl = f"{((entry - exit)/entry*100):.2f}%"
             except:
                 pass
-            msg += (f"{t['symbol']} {t['side'].upper()} | Entry: `{t['entry']}` | "
-                    f"Exit: `{exit_status}` | PnL: {pnl}\n")
+            # Add state/flags if present
+            flags = []
+            if t.get("breakeven"): flags.append("🟢 BE")
+            if t.get("trail"): flags.append("🟠 Trail")
+            if t.get("ignored"): flags.append("⏸ Ignored")
+            state = " | ".join(flags) if flags else ""
+            msg += (
+                f"{t['symbol']} {t['side'].upper()} {state}\n"
+                f"Entry: `{t['entry']}` | Exit: `{exit_status}` | Closed at: `{close_price}`\n"
+                f"Close Time: `{close_time}` | PnL: {pnl}\n"
+                "\n"
+            )
         send_message(msg, chat_id)
+
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
@@ -998,34 +1091,52 @@ def telegram_webhook():
             send_message("Test callback received!", from_user)
         elif cb_data.startswith("activate_"):
              symbol = cb_data.replace("activate_", "")
-             activate_trade(symbol, from_user)   # <--- CALL THE ACTUAL FUNCTION!
-
+             activate_trade(symbol, from_user)   # <--- CALL THE ACTUAL FUNCTION!        
         elif cb_data.startswith("close_"):
             symbol = cb_data.replace("close_", "")
-            send_message(f"❌ Trade closed for {symbol}", from_user)
+            trades = load_trades()
+            price = get_realtime_price(symbol)
+            now = int(time.time())
+            for t in trades:
+                if t["symbol"] == symbol and t.get("entered", False):
+                    t["entered"] = False
+                    t["close_time"] = now        # Save close time (Unix timestamp)
+                    t["close_price"] = price     # Save close price (or None if price unavailable)
+            save_trades(trades)
+            send_message(f"❌ Trade closed for {symbol} at price {price} (time: {now})", from_user)
 
         elif cb_data.startswith("breakeven_"):
             symbol = cb_data.replace("breakeven_", "")
+            trades = load_trades()
+            for t in trades:
+                if t["symbol"] == symbol and t.get("entered", False):
+                    t["breakeven"] = True        # Save the breakeven flag
+            save_trades(trades)
             send_message(f"🟢 Breakeven set for {symbol}", from_user)
 
         elif cb_data.startswith("trail_"):
             symbol = cb_data.replace("trail_", "")
+            trades = load_trades()
+            for t in trades:
+                if t["symbol"] == symbol and t.get("entered", False):
+                    t["trail"] = True            # Save the trailing SL flag
+            save_trades(trades)
             send_message(f"🟠 Trailing SL enabled for {symbol}", from_user)
+
         elif cb_data.startswith("ignore_"):
             symbol = cb_data.replace("ignore_", "")
+            trades = load_trades()
+            for t in trades:
+                if t["symbol"] == symbol and t.get("entered", False):
+                    t["ignored"] = True          # Save the ignore flag
+            save_trades(trades)
             send_message(f"⏸ Signal ignored for {symbol}", from_user)
+
         else:
             send_message(f"Unknown action: {cb_data}", from_user)
 
-
     return {"ok": True}, 200
 
-
-
-
-# ... [Everything else: Flask app, WebSocket handlers, scheduling, etc. remain unchanged from your current code]
-
-# ==== SCHEDULER & ENTRYPOINT ====
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
 
