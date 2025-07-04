@@ -22,6 +22,9 @@ last_signals = {}
 recent_signals = {}
 SIGNAL_COOLDOWN_SEC = 900
 SL_COUNTER_FILE = "sl_counters.json"
+# Global strict mode toggle
+STRICT_MODE = False  # Default to loose mode
+
 from flask import Flask, request
 from apscheduler.schedulers.background import BackgroundScheduler
 from websocket import WebSocketApp
@@ -79,13 +82,7 @@ COIN_SETTINGS = {
     "REPUSDT":  {"MIN_RR": 2.5, "MAX_RR": 3.5, "MIN_SL_PCT": 0.02, "MIN_TP_PCT": 0.04},
     "default":  {"MIN_RR": 2.5, "MAX_RR": 3.5, "MIN_SL_PCT": 0.013, "MIN_TP_PCT": 0.026}
 }
-# --- SIGNAL RULE TOGGLES (True = strict, False = relaxed) ---
-STRICT_EMA      = False   # True = last 2 closes above/below EMA; False = only last close
-STRICT_SMC      = False   # True = all SMC (BOS+MSS+OB); False = just BOS or OB
-STRICT_VOLUME   = False   # True = last_vol > 1.3x avg; False = last_vol > 1.15x avg
-STRICT_MACD     = False   # True = 15m AND 1h both agree; False = just 15m matches trend
-STRICT_BREAKOUT = False   # True = 15m close > high/low; False = entry near high/low ok
-STRICT_OBTEST   = False   # True = tight OB retest tolerance (0.3%); False = loose (0.5%)
+
 
 # ==== SIGNAL SCORING CONFIG ====
 SIGNAL_WEIGHTS = {
@@ -677,6 +674,24 @@ def plot_signal_chart(symbol, candles, entry=None, sl=None, tp1=None, tp2=None, 
     except Exception as e:
         logger.warning(f"Chart plotting failed for {symbol}: {e}")
         return None
+def update_strict_flags():
+    global STRICT_EMA, STRICT_SMC, STRICT_VOLUME, STRICT_MACD, STRICT_BREAKOUT, STRICT_OBTEST
+    if STRICT_MODE:
+        STRICT_EMA      = True
+        STRICT_SMC      = True
+        STRICT_VOLUME   = True
+        STRICT_MACD     = True
+        STRICT_BREAKOUT = True
+        STRICT_OBTEST   = True
+    else:
+        STRICT_EMA      = False
+        STRICT_SMC      = False
+        STRICT_VOLUME   = False
+        STRICT_MACD     = False
+        STRICT_BREAKOUT = False
+        STRICT_OBTEST   = False
+
+update_strict_flags()
 def best_intraday_signal_scan():
     strats = load_strategy()
     for symbol in SYMBOLS:
@@ -702,69 +717,99 @@ def best_intraday_signal_scan():
         ema1h = sum(closes_1h[-20:]) / 20
         ema4h = sum(closes_4h[-20:]) / 20
 
-        # --- EMA "2+ closes" trend agreement ---
-        if all(c["close"] > ema1h for c in candles_1h[-2:]) and all(c["close"] > ema4h for c in candles_4h[-2:]):
+        # --- EMA trend agreement (strict or relaxed) ---
+        if STRICT_EMA:
+            ema_long = all(c["close"] > ema1h for c in candles_1h[-2:]) and all(c["close"] > ema4h for c in candles_4h[-2:])
+            ema_short = all(c["close"] < ema1h for c in candles_1h[-2:]) and all(c["close"] < ema4h for c in candles_4h[-2:])
+        else:
+            ema_long = candles_1h[-1]["close"] > ema1h and candles_4h[-1]["close"] > ema4h
+            ema_short = candles_1h[-1]["close"] < ema1h and candles_4h[-1]["close"] < ema4h
+
+        if ema_long:
             side = "long"
-        elif all(c["close"] < ema1h for c in candles_1h[-2:]) and all(c["close"] < ema4h for c in candles_4h[-2:]):
+        elif ema_short:
             side = "short"
         else:
-            logger.info(f"{symbol}: No 2-candle EMA confirmation, skipping.")
+            logger.info(f"{symbol}: EMA trend not confirmed, skipping.")
             continue
 
-        # ----------- SCORE + SMC: require all 3 -----------
+        # --- SCORE + SMC (relaxed or strict) ---
         score, conf, reasons = score_signal(symbol, candles_15m, candles_1h, candles_4h, side=side)
         smc = smc_scan(symbol, "15")
         if score < SCORE_THRESHOLD_MODERATE:
             logger.info(f"{symbol}: Score {score} < {SCORE_THRESHOLD_MODERATE}, skipping.")
             continue
-        if not (smc and smc.get("bos") and smc.get("mss") and smc.get("ob")):
-            logger.info(f"{symbol}: SMC not all confirmed (need BOS+MSS+OB), skipping.")
-            continue
+        if STRICT_SMC:
+            if not (smc and smc.get("bos") and smc.get("mss") and smc.get("ob")):
+                logger.info(f"{symbol}: SMC not all confirmed (need BOS+MSS+OB), skipping.")
+                continue
+        else:
+            if not (smc and (smc.get("bos") or smc.get("ob"))):
+                logger.info(f"{symbol}: No BOS/OB SMC, skipping.")
+                continue
 
         entry = get_realtime_price(symbol)
         if entry is None:
             logger.info(f"{symbol}: No real-time price, skipping.")
             continue
 
-        # ----------- ORDER BLOCK + RETEST ENFORCEMENT (with log) -----------
+        # --- ORDER BLOCK + RETEST (loose/strict tolerance) ---
         ob_levels = detect_order_blocks(candles_15m, side=side)
         logger.info(f"{symbol}: Detected OB levels {ob_levels}")
         if not ob_levels:
             logger.info(f"{symbol}: No recent OB detected, skipping.")
             continue
-        if not is_retest(entry, ob_levels, side, tolerance=0.003):
+        ob_tol = 0.003 if STRICT_OBTEST else 0.005
+        if not is_retest(entry, ob_levels, side, tolerance=ob_tol):
             logger.info(f"{symbol}: Entry is NOT a retest of OB, skipping.")
             continue
 
-        # ----------- VOLUME SPIKE: >1.3× avg -----------
+        # --- Volume spike (strict or relaxed) ---
         last_vol = candles_15m[-1]["volume"]
         avg_vol = sum([c["volume"] for c in candles_15m[-10:]]) / 10
-        if last_vol <= 1.3 * avg_vol:
-            logger.info(f"{symbol}: Volume spike <1.3× avg, skipping.")
+        vol_factor = 1.3 if STRICT_VOLUME else 1.15
+        if last_vol <= vol_factor * avg_vol:
+            logger.info(f"{symbol}: Volume spike <{vol_factor}× avg, skipping.")
             continue
 
-        # ----------- MACD: 15m/1h agree, log values -----------
+        # --- MACD ---
         macd_15 = get_macd_histogram(candles_15m)
         macd_1h = get_macd_histogram(candles_1h)
         logger.info(f"{symbol}: MACD 15m={macd_15:.4f}, 1h={macd_1h:.4f}")
-        if side == "long" and (macd_15 <= 0.01 or macd_1h <= 0.01):
-            logger.info(f"{symbol}: MACD not clearly positive, skipping.")
-            continue
-        if side == "short" and (macd_15 >= -0.01 or macd_1h >= -0.01):
-            logger.info(f"{symbol}: MACD not clearly negative, skipping.")
-            continue
+        if STRICT_MACD:
+            if side == "long" and (macd_15 <= 0.01 or macd_1h <= 0.01):
+                logger.info(f"{symbol}: MACD not clearly positive, skipping.")
+                continue
+            if side == "short" and (macd_15 >= -0.01 or macd_1h >= -0.01):
+                logger.info(f"{symbol}: MACD not clearly negative, skipping.")
+                continue
+        else:
+            if side == "long" and macd_15 <= 0.01:
+                logger.info(f"{symbol}: MACD 15m not positive, skipping.")
+                continue
+            if side == "short" and macd_15 >= -0.01:
+                logger.info(f"{symbol}: MACD 15m not negative, skipping.")
+                continue
 
-        # ----------- BREAKOUT: require 15m close above/below high/low -----------
+        # --- BREAKOUT ---
         recent_high = max([c["high"] for c in candles_15m[-24:]])
         recent_low = min([c["low"] for c in candles_15m[-24:]])
-        if side == "long" and candles_15m[-1]["close"] <= recent_high:
-            logger.info(f"{symbol}: 15m close not above high, skipping.")
-            continue
-        if side == "short" and candles_15m[-1]["close"] >= recent_low:
-            logger.info(f"{symbol}: 15m close not below low, skipping.")
-            continue
+        if STRICT_BREAKOUT:
+            if side == "long" and candles_15m[-1]["close"] <= recent_high:
+                logger.info(f"{symbol}: 15m close not above high, skipping.")
+                continue
+            if side == "short" and candles_15m[-1]["close"] >= recent_low:
+                logger.info(f"{symbol}: 15m close not below low, skipping.")
+                continue
+        else:
+            if side == "long" and entry <= recent_high * 1.001:
+                logger.info(f"{symbol}: Entry not near recent high, skipping.")
+                continue
+            if side == "short" and entry >= recent_low * 0.999:
+                logger.info(f"{symbol}: Entry not near recent low, skipping.")
+                continue
 
-        # ----------- STOP-LOSS (structure-based with buffer) -----------
+        # --- STOP-LOSS & TP calculation ---
         atr = calculate_atr(candles_15m, 14)
         lookback = 20
         buffer = max(entry * 0.001, atr * 0.18)
@@ -791,7 +836,7 @@ def best_intraday_signal_scan():
                 logger.info(f"{symbol}: Risk too small (risk={risk}, entry={entry}, atr={atr}), skipping.")
                 continue
 
-        # ----------- TP1, TP2, TP3, TP4 -----------
+        # --- TP1, TP2, TP3, TP4 ---
         if side == "long":
             tp1 = round(entry + risk * min_rr, 6)
             tp2 = round(entry + risk * max_rr, 6)
@@ -850,6 +895,8 @@ def best_intraday_signal_scan():
         if chart_path:
             send_chart_image(chart_path, caption=f"{symbol} Signal Chart")
         active_signals[key] = True
+
+
 
 
 
@@ -936,6 +983,15 @@ def handle_trades_command(chat_id):
             except Exception:
                 pnl_str = "N/A"
 
+            # --- Add history & AI advice ---
+            hist = get_trade_history_stats(t['symbol'], t['side'])
+            ai = get_live_trade_advice(
+                t['symbol'], t['side'],
+                float(t['entry']), float(t['sl']),
+                float(t.get('tp1', 0)), float(t.get('tp2', 0)),
+                float(t.get('tp3', 0)), float(t.get('tp4', 0))
+            )
+
             msg += (
                 f"{t['symbol']} {t['side'].upper()} {state}\n"
                 f"Entry: `{t['entry']}` | SL: `{t['sl']}`\n"
@@ -944,9 +1000,13 @@ def handle_trades_command(chat_id):
                 f"TP3: `{t.get('tp3','')}` {'✅' if t.get('tp3_hit') else '❌'}\n"
                 f"TP4: `{t.get('tp4','')}`\n"
                 f"Live PnL: *{pnl_str}*\n"
+                f"📊 *History:* TP1: {hist['tp1']}%  TP2: {hist['tp2']}%  TP3: {hist['tp3']}%  SL: {hist['sl']}%  (out of {hist['n']})\n"
+                f"🤖 *AI Advice:*\n{ai}\n"
                 "\n"
             )
         send_message(msg, chat_id)
+
+
 
 
 
@@ -1152,12 +1212,138 @@ def send_daily_stats():
         f"Total PnL: {total_pnl:+.2f}%\n"
     )
     send_message(msg, CHAT_ID)
+def get_tp_sl_odds(symbol=None, side=None, last_n=100):
+    """Compute TP1/TP2/TP3/TP4/SL hit rates from last N closed trades (optionally filter by symbol/side)"""
+    trades = load_trades()
+    # Only look at closed trades that have SL/TP flags set
+    closed = [t for t in trades if not t.get("entered", True)]
+    if symbol: closed = [t for t in closed if t["symbol"] == symbol]
+    if side:   closed = [t for t in closed if t["side"] == side]
+    closed = closed[-last_n:]  # most recent N
 
+    if not closed:
+        # Avoid divide by zero, fallback to 0.5 for all
+        return (0.5, 0.5, 0.5, 0.5, 0.5)
+
+    tp1 = sum(t.get("tp1_hit") for t in closed) / len(closed)
+    tp2 = sum(t.get("tp2_hit") for t in closed) / len(closed)
+    tp3 = sum(t.get("tp3_hit") for t in closed) / len(closed)
+    tp4 = sum(t.get("tp4_hit") for t in closed) / len(closed)
+    sl  = sum(t.get("sl_hit")  for t in closed) / len(closed)
+    return (tp1, tp2, tp3, tp4, sl)
+def get_trade_advice(symbol, side, entry, tp1, tp2, tp3, tp4, sl):
+    # This should load your real trade history with TP/SL hit tracking
+    history = load_trade_history()  # <-- You must implement this! (see below)
+    same_signal_trades = [t for t in history if t["symbol"] == symbol and t["side"] == side]
+    def pct_hit(key):
+        if not same_signal_trades: return "N/A"
+        return "{:.0f}%".format(100 * sum(1 for t in same_signal_trades if t.get(key)) / len(same_signal_trades))
+    odds = (
+        f"TP1: {pct_hit('tp1_hit')} | TP2: {pct_hit('tp2_hit')} | "
+        f"TP3: {pct_hit('tp3_hit')} | TP4: {pct_hit('tp4_hit')} | SL: {pct_hit('sl_hit')}"
+    )
+    advice = f"🤖 *AI advice:*\n{odds}\n"
+    # Extra suggestion logic
+    if pct_hit('tp1_hit') != "N/A" and float(pct_hit('tp1_hit').replace('%','')) > 75:
+        advice += "Odds good for TP1. Consider trailing after TP1!\n"
+    elif pct_hit('sl_hit') != "N/A" and float(pct_hit('sl_hit').replace('%','')) > 20:
+        advice += "⚠️ SL risk higher than usual—manage risk closely.\n"
+    return advice
+def get_trade_history_stats(symbol, side, N=100):
+    # Load last N closed trades for symbol+side from your trade history
+    trades = load_trades()
+    closed = [t for t in trades if t['symbol']==symbol and t['side']==side and not t.get("entered")]
+    recent = closed[-N:] if len(closed) > N else closed
+    def pct(key):
+        return int(100 * sum(1 for t in recent if t.get(key)) / len(recent)) if recent else 0
+    return {
+        'tp1': pct("tp1_hit"),
+        'tp2': pct("tp2_hit"),
+        'tp3': pct("tp3_hit"),
+        'tp4': pct("tp4_hit"),
+        'sl':  pct("stopped"),
+        'n':   len(recent)
+    }
+def get_live_trade_advice(symbol, side, entry, sl, tp1, tp2, tp3, tp4):
+    price = get_realtime_price(symbol)
+    if not price:
+        return "Live price unavailable."
+    # Calculate distances
+    if side == "long":
+        to_tp1 = max(0, tp1 - price)
+        to_tp2 = max(0, tp2 - price)
+        to_tp3 = max(0, tp3 - price)
+        to_sl = max(0, price - sl)
+        dist = price - entry
+        direction = price >= entry
+    else:
+        to_tp1 = max(0, price - tp1)
+        to_tp2 = max(0, price - tp2)
+        to_tp3 = max(0, price - tp3)
+        to_sl = max(0, sl - price)
+        dist = entry - price
+        direction = price <= entry
+
+    # Live indicators
+    candles_15m = get_candles(symbol, "15", 40)
+    rsi = get_rsi(candles_15m)
+    atr = calculate_atr(candles_15m, 14)
+    momentum = price - candles_15m[-2]["close"]  # Change over last 2 candles
+    trend = "UP" if price > sum(c["close"] for c in candles_15m[-20:])/20 else "DOWN"
+    momentum_str = "✅ strong" if abs(momentum) > atr*0.2 else "⚠️ weak"
+
+    # Probabilities (quick and simple, not ML)
+    tp1_chance = 70 + 15*(direction) + 5*(rsi > 60 if side=="long" else rsi < 40) + 5*(momentum > 0 if side=="long" else momentum < 0)
+    tp2_chance = tp1_chance - 18
+    tp3_chance = tp1_chance - 32
+    sl_chance = 100 - tp1_chance  # Simplified, for clear display
+
+    # Clamp to 5-95%
+    def clamp(x): return max(5, min(95, x))
+    tp1_chance = clamp(tp1_chance)
+    tp2_chance = clamp(tp2_chance)
+    tp3_chance = clamp(tp3_chance)
+    sl_chance  = clamp(sl_chance)
+
+    advice = (
+        f"— *Price*: `{price}` (entry {entry})\n"
+        f"— *Distance to TP1*: {to_tp1:.2f} | TP2: {to_tp2:.2f} | TP3: {to_tp3:.2f}\n"
+        f"— *RSI*: {rsi:.1f} | *ATR*: {atr:.2f}\n"
+        f"— *Momentum*: {momentum_str}\n"
+        f"— *Trend*: {trend}\n"
+        f"— *Live Probabilities:*\n"
+        f"   TP1: *{tp1_chance}%*   TP2: *{tp2_chance}%*   TP3: *{tp3_chance}%*   SL: *{sl_chance}%*\n"
+        f"*Advice:* {'Hold' if tp1_chance > sl_chance else 'Consider closing or tighten SL!'}"
+    )
+    return advice
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     data = request.get_json(force=True)
-
+    if "message" in data:
+        text = data["message"].get("text", "")
+        chat_id = data["message"]["chat"]["id"]
+        if text == "/start":
+            send_message("🤖 Bot is online! Welcome!", chat_id)
+        elif text in ("/trades", "/status"):
+            handle_trades_command(chat_id)
+        elif text == "/history":
+            handle_history_command(chat_id)
+        elif text == "/stats":
+            send_daily_stats()
+        elif text.startswith("/strictmode"):
+            parts = text.strip().split()
+            if len(parts) > 1 and parts[1].lower() in ("on", "off"):
+                new_mode = parts[1].lower() == "on"
+                global STRICT_MODE
+                STRICT_MODE = new_mode
+                update_strict_flags()
+                status = "STRICT" if STRICT_MODE else "LOOSE"
+                send_message(f"Signal filter set to *{status}* mode.", chat_id)
+            else:
+                mode = "STRICT" if STRICT_MODE else "LOOSE"
+                send_message(f"Current mode: *{mode}*\nUsage: /strictmode on  or  /strictmode off", chat_id)
+            return  # prevent double response
     # Handle normal messages
     if "message" in data:
         text = data["message"].get("text", "")
@@ -1185,8 +1371,26 @@ def telegram_webhook():
         if cb_data == "test_callback":
             send_message("Test callback received!", from_user)
         elif cb_data.startswith("activate_"):
-             symbol = cb_data.replace("activate_", "")
-             activate_trade(symbol, from_user)   # <--- CALL THE ACTUAL FUNCTION!        
+            symbol = cb_data.replace("activate_", "")
+            activate_trade(symbol, from_user)
+
+            # Load the newly activated trade
+            trades = load_trades()
+            t = next((x for x in trades if x["symbol"] == symbol and x.get("entered", False)), None)
+            if t:
+                hist = get_trade_history_stats(t['symbol'], t['side'])
+                ai = get_live_trade_advice(
+                    t['symbol'], t['side'],
+                    float(t['entry']), float(t['sl']),
+                    float(t.get('tp1', 0)), float(t.get('tp2', 0)),
+                    float(t.get('tp3', 0)), float(t.get('tp4', 0))
+                )
+                advice_msg = (
+                    f"📊 *History:* TP1: {hist['tp1']}%  TP2: {hist['tp2']}%  TP3: {hist['tp3']}%  SL: {hist['sl']}%  (out of {hist['n']})\n"
+                    f"🤖 *AI Advice:*\n{ai}"
+                )
+                send_message(advice_msg, from_user)
+
         elif cb_data.startswith("close_"):
             symbol = cb_data.replace("close_", "")
             trades = load_trades()
