@@ -79,6 +79,13 @@ COIN_SETTINGS = {
     "REPUSDT":  {"MIN_RR": 2.5, "MAX_RR": 3.5, "MIN_SL_PCT": 0.02, "MIN_TP_PCT": 0.04},
     "default":  {"MIN_RR": 2.5, "MAX_RR": 3.5, "MIN_SL_PCT": 0.013, "MIN_TP_PCT": 0.026}
 }
+# --- SIGNAL RULE TOGGLES (True = strict, False = relaxed) ---
+STRICT_EMA      = False   # True = last 2 closes above/below EMA; False = only last close
+STRICT_SMC      = False   # True = all SMC (BOS+MSS+OB); False = just BOS or OB
+STRICT_VOLUME   = False   # True = last_vol > 1.3x avg; False = last_vol > 1.15x avg
+STRICT_MACD     = False   # True = 15m AND 1h both agree; False = just 15m matches trend
+STRICT_BREAKOUT = False   # True = 15m close > high/low; False = entry near high/low ok
+STRICT_OBTEST   = False   # True = tight OB retest tolerance (0.3%); False = loose (0.5%)
 
 # ==== SIGNAL SCORING CONFIG ====
 SIGNAL_WEIGHTS = {
@@ -694,25 +701,24 @@ def best_intraday_signal_scan():
         closes_4h = [c["close"] for c in candles_4h[-21:]]
         ema1h = sum(closes_1h[-20:]) / 20
         ema4h = sum(closes_4h[-20:]) / 20
-        price_1h = closes_1h[-1]
-        price_4h = closes_4h[-1]
 
-        # ----------- TREND AGREEMENT -----------
-        if price_1h > ema1h and price_4h > ema4h:
+        # --- EMA "2+ closes" trend agreement ---
+        if all(c["close"] > ema1h for c in candles_1h[-2:]) and all(c["close"] > ema4h for c in candles_4h[-2:]):
             side = "long"
-        elif price_1h < ema1h and price_4h < ema4h:
+        elif all(c["close"] < ema1h for c in candles_1h[-2:]) and all(c["close"] < ema4h for c in candles_4h[-2:]):
             side = "short"
         else:
-            logger.info(f"{symbol}: No clear trend on 1h/4h EMA, skipping.")
+            logger.info(f"{symbol}: No 2-candle EMA confirmation, skipping.")
             continue
 
-        # ----------- SCORE + SMC -----------
+        # ----------- SCORE + SMC: require all 3 -----------
         score, conf, reasons = score_signal(symbol, candles_15m, candles_1h, candles_4h, side=side)
+        smc = smc_scan(symbol, "15")
         if score < SCORE_THRESHOLD_MODERATE:
             logger.info(f"{symbol}: Score {score} < {SCORE_THRESHOLD_MODERATE}, skipping.")
             continue
-        if "SMC High Confidence (15m)" not in reasons:
-            logger.info(f"{symbol}: SMC High Confidence missing, skipping.")
+        if not (smc and smc.get("bos") and smc.get("mss") and smc.get("ob")):
+            logger.info(f"{symbol}: SMC not all confirmed (need BOS+MSS+OB), skipping.")
             continue
 
         entry = get_realtime_price(symbol)
@@ -720,8 +726,9 @@ def best_intraday_signal_scan():
             logger.info(f"{symbol}: No real-time price, skipping.")
             continue
 
-        # ----------- ORDER BLOCK + RETEST ENFORCEMENT -----------
+        # ----------- ORDER BLOCK + RETEST ENFORCEMENT (with log) -----------
         ob_levels = detect_order_blocks(candles_15m, side=side)
+        logger.info(f"{symbol}: Detected OB levels {ob_levels}")
         if not ob_levels:
             logger.info(f"{symbol}: No recent OB detected, skipping.")
             continue
@@ -729,31 +736,32 @@ def best_intraday_signal_scan():
             logger.info(f"{symbol}: Entry is NOT a retest of OB, skipping.")
             continue
 
-        # ----------- VOLUME SPIKE -----------
+        # ----------- VOLUME SPIKE: >1.3× avg -----------
         last_vol = candles_15m[-1]["volume"]
         avg_vol = sum([c["volume"] for c in candles_15m[-10:]]) / 10
-        if last_vol <= 1.2 * avg_vol:
-            logger.info(f"{symbol}: Volume spike not strong enough (last_vol={last_vol}, avg_vol={avg_vol}), skipping.")
+        if last_vol <= 1.3 * avg_vol:
+            logger.info(f"{symbol}: Volume spike <1.3× avg, skipping.")
             continue
 
-        # ----------- MACD -----------
+        # ----------- MACD: 15m/1h agree, log values -----------
         macd_15 = get_macd_histogram(candles_15m)
         macd_1h = get_macd_histogram(candles_1h)
-        if side == "long" and (macd_15 <= 0 or macd_1h <= 0):
-            logger.info(f"{symbol}: MACD not both positive, skipping.")
+        logger.info(f"{symbol}: MACD 15m={macd_15:.4f}, 1h={macd_1h:.4f}")
+        if side == "long" and (macd_15 <= 0.01 or macd_1h <= 0.01):
+            logger.info(f"{symbol}: MACD not clearly positive, skipping.")
             continue
-        if side == "short" and (macd_15 >= 0 or macd_1h >= 0):
-            logger.info(f"{symbol}: MACD not both negative, skipping.")
+        if side == "short" and (macd_15 >= -0.01 or macd_1h >= -0.01):
+            logger.info(f"{symbol}: MACD not clearly negative, skipping.")
             continue
 
-        # ----------- BREAKOUT FILTER -----------
+        # ----------- BREAKOUT: require 15m close above/below high/low -----------
         recent_high = max([c["high"] for c in candles_15m[-24:]])
         recent_low = min([c["low"] for c in candles_15m[-24:]])
-        if side == "long" and entry <= recent_high:
-            logger.info(f"{symbol}: Not breaking recent high ({entry} <= {recent_high}), skipping.")
+        if side == "long" and candles_15m[-1]["close"] <= recent_high:
+            logger.info(f"{symbol}: 15m close not above high, skipping.")
             continue
-        if side == "short" and entry >= recent_low:
-            logger.info(f"{symbol}: Not breaking recent low ({entry} >= {recent_low}), skipping.")
+        if side == "short" and candles_15m[-1]["close"] >= recent_low:
+            logger.info(f"{symbol}: 15m close not below low, skipping.")
             continue
 
         # ----------- STOP-LOSS (structure-based with buffer) -----------
@@ -842,6 +850,8 @@ def best_intraday_signal_scan():
         if chart_path:
             send_chart_image(chart_path, caption=f"{symbol} Signal Chart")
         active_signals[key] = True
+
+
 
 # Call this update_blacklist_on_sl(symbol) in your process_price_update after SL
 # Example (in your process_price_update, after setting entered=False for an SL):
