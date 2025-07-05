@@ -23,7 +23,7 @@ recent_signals = {}
 SIGNAL_COOLDOWN_SEC = 900
 SL_COUNTER_FILE = "sl_counters.json"
 # Global strict mode toggle
-STRICT_MODE = False  # Default to loose mode
+STRICT_LEVEL = 0  # Default to loose mode
 
 from flask import Flask, request
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -674,24 +674,42 @@ def plot_signal_chart(symbol, candles, entry=None, sl=None, tp1=None, tp2=None, 
     except Exception as e:
         logger.warning(f"Chart plotting failed for {symbol}: {e}")
         return None
+STRICT_LEVEL = 0  # 0 = loose, 1 = moderate, 2 = strict
+
 def update_strict_flags():
+    global STRICT_LEVEL
     global STRICT_EMA, STRICT_SMC, STRICT_VOLUME, STRICT_MACD, STRICT_BREAKOUT, STRICT_OBTEST
-    if STRICT_MODE:
-        STRICT_EMA      = True
-        STRICT_SMC      = True
-        STRICT_VOLUME   = True
-        STRICT_MACD     = True
-        STRICT_BREAKOUT = True
-        STRICT_OBTEST   = True
-    else:
+
+    if STRICT_LEVEL == 0:    # Loose
         STRICT_EMA      = False
         STRICT_SMC      = False
         STRICT_VOLUME   = False
         STRICT_MACD     = False
         STRICT_BREAKOUT = False
         STRICT_OBTEST   = False
+    elif STRICT_LEVEL == 1:  # A bit strict
+        STRICT_EMA      = True
+        STRICT_SMC      = False
+        STRICT_VOLUME   = True
+        STRICT_MACD     = False
+        STRICT_BREAKOUT = False
+        STRICT_OBTEST   = False
+    elif STRICT_LEVEL == 2:  # More strict
+        STRICT_EMA      = True
+        STRICT_SMC      = True
+        STRICT_VOLUME   = True
+        STRICT_MACD     = True
+        STRICT_BREAKOUT = False
+        STRICT_OBTEST   = False
+    elif STRICT_LEVEL >= 3:  # Maximum strict
+        STRICT_EMA      = True
+        STRICT_SMC      = True
+        STRICT_VOLUME   = True
+        STRICT_MACD     = True
+        STRICT_BREAKOUT = True
+        STRICT_OBTEST   = True
 
-update_strict_flags()
+
 def best_intraday_signal_scan():
     strats = load_strategy()
     for symbol in SYMBOLS:
@@ -1233,7 +1251,7 @@ def get_tp_sl_odds(symbol=None, side=None, last_n=100):
     return (tp1, tp2, tp3, tp4, sl)
 def get_trade_advice(symbol, side, entry, tp1, tp2, tp3, tp4, sl):
     # This should load your real trade history with TP/SL hit tracking
-    history = load_trade_history()  # <-- You must implement this! (see below)
+    history = load_trades()  # <-- You must implement this! (see below)
     same_signal_trades = [t for t in history if t["symbol"] == symbol and t["side"] == side]
     def pct_hit(key):
         if not same_signal_trades: return "N/A"
@@ -1338,18 +1356,32 @@ def telegram_webhook():
         elif text == "/stats":
             send_daily_stats()
         elif text.startswith("/strictmode"):
+            global STRICT_LEVEL
             parts = text.strip().split()
-            if len(parts) > 1 and parts[1].lower() in ("on", "off"):
-                new_mode = parts[1].lower() == "on"
-                global STRICT_MODE
-                STRICT_MODE = new_mode
+            levels = {
+                "loose": 0, "easy": 0,
+                "mid": 1, "medium": 1,
+                "strict": 2, "hard": 2,
+                "max": 3, "hardcore": 3
+            }
+            if len(parts) > 1:
+                lvl = parts[1].lower()
+                if lvl.isdigit():
+                    STRICT_LEVEL = int(lvl)
+                elif lvl in levels:
+                    STRICT_LEVEL = levels[lvl]
+                else:
+                    send_message(
+                        "Usage: /strictmode [level]\nLevels: 0 (loose), 1 (medium), 2 (strict), 3 (max)",
+                        chat_id)
+                    return {"ok": True}, 200
                 update_strict_flags()
-                status = "STRICT" if STRICT_MODE else "LOOSE"
-                send_message(f"Signal filter set to *{status}* mode.", chat_id)
+                send_message(f"Strict mode level set to *{STRICT_LEVEL}*", chat_id)
             else:
-                mode = "STRICT" if STRICT_MODE else "LOOSE"
-                send_message(f"Current mode: *{mode}*\nUsage: /strictmode on  or  /strictmode off", chat_id)
-            return  # <--- super important! Prevents double response
+                send_message(
+                    f"Current strict level: *{STRICT_LEVEL}*\nUsage: /strictmode [0-3]",
+                    chat_id)
+            return {"ok": True}, 200
 
     # ---- Handle button clicks (callback_query) ----
     if "callback_query" in data:
@@ -1429,6 +1461,7 @@ def telegram_webhook():
             send_message(f"Unknown action: {cb_data}", from_user)
 
     return {"ok": True}, 200
+
 
 
 
