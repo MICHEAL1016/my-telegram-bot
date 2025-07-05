@@ -1320,6 +1320,9 @@ def get_live_trade_advice(symbol, side, entry, sl, tp1, tp2, tp3, tp4):
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     data = request.get_json(force=True)
+    logger.info("Webhook received from %s", request.remote_addr)
+    logger.info("Headers: %s", dict(request.headers))
+    logger.info("Data: %s", json.dumps(data))
 
     # ---- Handle normal messages (ONE block only) ----
     if "message" in data:
@@ -1426,6 +1429,7 @@ def telegram_webhook():
             send_message(f"Unknown action: {cb_data}", from_user)
 
     return {"ok": True}, 200
+
 
 
 if __name__ == "__main__":
