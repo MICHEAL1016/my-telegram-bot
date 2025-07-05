@@ -4,9 +4,6 @@ from dotenv import load_dotenv
 # Load .env BEFORE you try to use os.getenv
 load_dotenv()
 
-print("BOT_TOKEN:", os.getenv("BOT_TOKEN"))
-print("CHAT_ID:", os.getenv("CHAT_ID"))
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
@@ -30,6 +27,13 @@ STRICT_VOLUME = False
 STRICT_MACD = False
 STRICT_BREAKOUT = False
 STRICT_OBTEST = False
+STRICT_MULTI_TF = False
+STRICT_RSI = False
+STRICT_MIN_RR = False
+STRICT_VOLATILITY = False
+STRICT_NO_OVERLAP = False
+STRICT_CONFIRMATION_BARS = False
+STRICT_OB_RET = False
 from flask import Flask, request
 from apscheduler.schedulers.background import BackgroundScheduler
 from websocket import WebSocketApp
@@ -457,11 +461,32 @@ def detect_reversal_candle(symbol, tf="15"):
     if lw > body * 2 and uw < body:
         return "Bullish Pin Bar"
     return None
+def trail_stop_loss(trade, trigger_price, symbol, mode="atr", atr_mult=1.0, pct_trail=0.015):
+    """
+    Move SL to a tighter value after TP1/TP2/TP3 hit.
+    - mode="atr": SL trails by (ATR * atr_mult) from trigger_price
+    - mode="pct": SL trails by (pct_trail * price) from trigger_price
+    """
+    side = trade["side"]
+    if mode == "atr":
+        atr = calculate_atr(get_candles(symbol, "15", 20), 14)
+        if side == "long":
+            new_sl = trigger_price - atr * atr_mult
+        else:
+            new_sl = trigger_price + atr * atr_mult
+    else:  # percentage trail
+        if side == "long":
+            new_sl = trigger_price * (1 - pct_trail)
+        else:
+            new_sl = trigger_price * (1 + pct_trail)
+    return round(new_sl, 6)
+
 def activate_trade(symbol, user_id):
     sig = last_signals.get(symbol)
     if not sig:
         send_message(f"⚠️ No signal data to activate for {symbol}.", user_id)
         return
+
     trades = load_trades()
     # Don't activate if already active for this symbol/side
     for t in trades:
@@ -478,12 +503,28 @@ def activate_trade(symbol, user_id):
         "tp2": sig.get("tp2"),
         "tp3": sig.get("tp3"),
         "tp4": sig.get("tp4"),
+        "result": "open",
+        "strict_level": STRICT_LEVEL,
+        "opened_at": time.time(),
+        "closed_time": None,
         "tp1_hit": False,
         "tp2_hit": False,
         "tp3_hit": False,
+        "tp4_hit": False,
         "entered": True,
-        "activated_at": time.time()
+        "remaining_volume": 1.0,
+        "partial_exits": [],
+        "realized_pnl": 0.0,
+        "activated_at": time.time(),
+        "user_id": user_id,
+        # === NEW FIELDS for partials ===
+        "volume": 1.0,             
+        "realized_pnl": 0.0,        # sum of partial PnLs booked
+        "partial_exits": [],        # list of dicts: {"tp": "TP1", "price": x, "volume": y, "pnl": z}
+        "breakeven": False,
+        "trail": False,
     }
+
     trades.append(trade)
     save_trades(trades)
     send_message(
@@ -492,6 +533,43 @@ def activate_trade(symbol, user_id):
         f"TP1: `{sig['tp1']}` | TP2: `{sig.get('tp2','')}` | TP3: `{sig.get('tp3','')}` | TP4: `{sig.get('tp4','')}`",
         user_id
     )
+def check_trades():
+    trades = load_trades()
+    for t in trades:
+        if not t.get("entered", False):
+            continue
+        price = get_realtime_price(t["symbol"])
+        # ---- STOP-LOSS hit ----
+        if price is None:
+            continue
+        if t["side"] == "long" and price <= t["sl"]:
+            close_trade(t["symbol"], t["side"], "loss", price)
+            send_message(f"🚨 SL hit for {t['symbol']} {t['side']}. Trade closed.", t.get("user_id"))
+        elif t["side"] == "short" and price >= t["sl"]:
+            close_trade(t["symbol"], t["side"], "loss", price)
+            send_message(f"🚨 SL hit for {t['symbol']} {t['side']}. Trade closed.", t.get("user_id"))
+        # ---- TP1 hit ----
+        elif t["side"] == "long" and price >= t["tp1"]:
+            close_trade(t["symbol"], t["side"], "win", price)
+            send_message(f"🎯 TP1 hit for {t['symbol']} {t['side']}. Trade closed as WIN.", t.get("user_id"))
+        elif t["side"] == "short" and price <= t["tp1"]:
+            close_trade(t["symbol"], t["side"], "win", price)
+            send_message(f"🎯 TP1 hit for {t['symbol']} {t['side']}. Trade closed as WIN.", t.get("user_id"))
+
+def close_trade(symbol, side, result, price=None):
+    trades = load_trades()
+    now = time.time()
+    closed = False
+    for t in trades:
+        if t["symbol"] == symbol and t["side"] == side and t.get("entered", False):
+            t["entered"] = False
+            t["result"] = result  # "win" or "loss"
+            t["closed_time"] = now
+            if price is not None:
+                t["close_price"] = price
+            closed = True
+    save_trades(trades)
+    return closed  # Returns True if closed, else False
 
 def detect_candle_patterns(symbol, tfs=["15", "60"]):
     allowed_tfs = {"15", "60", "240"}
@@ -684,35 +762,47 @@ STRICT_LEVEL = 0  # 0 = loose, 1 = moderate, 2 = strict
 def update_strict_flags():
     global STRICT_LEVEL
     global STRICT_EMA, STRICT_SMC, STRICT_VOLUME, STRICT_MACD, STRICT_BREAKOUT, STRICT_OBTEST
+    global STRICT_MULTI_TF, STRICT_RSI, STRICT_MIN_RR, STRICT_VOLATILITY, STRICT_NO_OVERLAP, STRICT_CONFIRMATION_BARS, STRICT_OB_RET
 
-    if STRICT_LEVEL == 0:    # Loose
-        STRICT_EMA      = False
-        STRICT_SMC      = False
-        STRICT_VOLUME   = False
-        STRICT_MACD     = False
-        STRICT_BREAKOUT = False
-        STRICT_OBTEST   = False
-    elif STRICT_LEVEL == 1:  # A bit strict
-        STRICT_EMA      = True
-        STRICT_SMC      = False
-        STRICT_VOLUME   = True
-        STRICT_MACD     = False
-        STRICT_BREAKOUT = False
-        STRICT_OBTEST   = False
-    elif STRICT_LEVEL == 2:  # More strict
-        STRICT_EMA      = True
-        STRICT_SMC      = True
-        STRICT_VOLUME   = True
-        STRICT_MACD     = True
-        STRICT_BREAKOUT = False
-        STRICT_OBTEST   = False
-    elif STRICT_LEVEL >= 3:  # Maximum strict
-        STRICT_EMA      = True
-        STRICT_SMC      = True
-        STRICT_VOLUME   = True
-        STRICT_MACD     = True
+    if STRICT_LEVEL == 0:
+        STRICT_EMA = STRICT_SMC = STRICT_VOLUME = STRICT_MACD = STRICT_BREAKOUT = STRICT_OBTEST = False
+        STRICT_MULTI_TF = STRICT_RSI = STRICT_MIN_RR = STRICT_VOLATILITY = STRICT_NO_OVERLAP = STRICT_CONFIRMATION_BARS = STRICT_OB_RET = False
+    elif STRICT_LEVEL == 1:
+        STRICT_EMA = True
+        STRICT_VOLUME = True
+        STRICT_MULTI_TF = False
+        STRICT_RSI = True
+        STRICT_MIN_RR = False
+        STRICT_VOLATILITY = False
+        STRICT_NO_OVERLAP = False
+        STRICT_CONFIRMATION_BARS = False
+        STRICT_OB_RET = False
+    elif STRICT_LEVEL == 2:
+        STRICT_EMA = True
+        STRICT_SMC = True
+        STRICT_VOLUME = True
+        STRICT_MACD = True
+        STRICT_MULTI_TF = True
+        STRICT_RSI = True
+        STRICT_MIN_RR = True
+        STRICT_VOLATILITY = True
+        STRICT_NO_OVERLAP = True
+        STRICT_CONFIRMATION_BARS = True
+        STRICT_OB_RET = False
+    elif STRICT_LEVEL >= 3:
+        STRICT_EMA = True
+        STRICT_SMC = True
+        STRICT_VOLUME = True
+        STRICT_MACD = True
         STRICT_BREAKOUT = True
-        STRICT_OBTEST   = True
+        STRICT_OBTEST = True
+        STRICT_MULTI_TF = True
+        STRICT_RSI = True
+        STRICT_MIN_RR = True
+        STRICT_VOLATILITY = True
+        STRICT_NO_OVERLAP = True
+        STRICT_CONFIRMATION_BARS = True
+        STRICT_OB_RET = True
 
 
 def best_intraday_signal_scan():
@@ -735,8 +825,10 @@ def best_intraday_signal_scan():
             logger.info(f"{symbol}: Not enough candles, skipping.")
             continue
 
+        closes_15m = [c["close"] for c in candles_15m[-21:]]
         closes_1h = [c["close"] for c in candles_1h[-21:]]
         closes_4h = [c["close"] for c in candles_4h[-21:]]
+        ema15 = sum(closes_15m[-20:]) / 20
         ema1h = sum(closes_1h[-20:]) / 20
         ema4h = sum(closes_4h[-20:]) / 20
 
@@ -756,6 +848,80 @@ def best_intraday_signal_scan():
             logger.info(f"{symbol}: EMA trend not confirmed, skipping.")
             continue
 
+        # ===== STRICT LOGIC FILTERS =====
+
+        # STRICT_MULTI_TF: Require 3/3 TFs agree (15m, 1h, 4h EMA)
+        if STRICT_MULTI_TF:
+            up = sum([
+                closes_15m[-1] > ema15,
+                closes_1h[-1] > ema1h,
+                closes_4h[-1] > ema4h
+            ])
+            down = sum([
+                closes_15m[-1] < ema15,
+                closes_1h[-1] < ema1h,
+                closes_4h[-1] < ema4h
+            ])
+            if side == "long" and up < 3:
+                logger.info(f"{symbol}: STRICT_MULTI_TF not all UP, skipping.")
+                continue
+            if side == "short" and down < 3:
+                logger.info(f"{symbol}: STRICT_MULTI_TF not all DOWN, skipping.")
+                continue
+
+        # STRICT_RSI: Enforce tighter bands
+        if STRICT_RSI:
+            rsi = get_rsi(candles_15m)
+            if side == "long" and rsi > 65:
+                logger.info(f"{symbol}: STRICT_RSI long, RSI {rsi:.1f} > 65, skipping.")
+                continue
+            if side == "short" and rsi < 35:
+                logger.info(f"{symbol}: STRICT_RSI short, RSI {rsi:.1f} < 35, skipping.")
+                continue
+
+        # STRICT_MIN_RR: Force higher min RR (e.g. 3.0+)
+        strict_min_rr = 3.0 if STRICT_MIN_RR else min_rr
+
+        # STRICT_VOLATILITY: Require ATR above a threshold
+        entry = get_realtime_price(symbol)
+        if entry is None:
+            logger.info(f"{symbol}: No real-time price, skipping.")
+            continue
+        if STRICT_VOLATILITY:
+            atr = calculate_atr(candles_15m, 14)
+            if atr < entry * 0.0015:
+                logger.info(f"{symbol}: STRICT_VOLATILITY ATR too low, skipping.")
+                continue
+
+        # STRICT_NO_OVERLAP: Skip if open trade exists for symbol
+        if STRICT_NO_OVERLAP:
+            open_trades = [t for t in load_trades() if t["symbol"] == symbol and t.get("entered", False)]
+            if open_trades:
+                logger.info(f"{symbol}: STRICT_NO_OVERLAP - open trade exists, skipping.")
+                continue
+
+        # STRICT_CONFIRMATION_BARS: Require X closes above/below EMA
+        if STRICT_CONFIRMATION_BARS:
+            X = 3  # Change as needed
+            confirm_closes = closes_15m[-X:]
+            if side == "long":
+                if not all(c > ema15 for c in confirm_closes):
+                    logger.info(f"{symbol}: STRICT_CONFIRMATION_BARS not enough closes above EMA, skipping.")
+                    continue
+            else:
+                if not all(c < ema15 for c in confirm_closes):
+                    logger.info(f"{symbol}: STRICT_CONFIRMATION_BARS not enough closes below EMA, skipping.")
+                    continue
+
+        # STRICT_OB_RET: Require "perfect" order block retest (exact touch)
+        ob_levels = detect_order_blocks(candles_15m, side=side)
+        if STRICT_OB_RET:
+            if not ob_levels or not any(abs(entry - ob) / entry < 1e-4 for ob in ob_levels):
+                logger.info(f"{symbol}: STRICT_OB_RET: entry not perfect OB retest, skipping.")
+                continue
+
+        # ===== END STRICT LOGIC FILTERS =====
+
         # --- SCORE + SMC (relaxed or strict) ---
         score, conf, reasons = score_signal(symbol, candles_15m, candles_1h, candles_4h, side=side)
         smc = smc_scan(symbol, "15")
@@ -771,19 +937,12 @@ def best_intraday_signal_scan():
                 logger.info(f"{symbol}: No BOS/OB SMC, skipping.")
                 continue
 
-        entry = get_realtime_price(symbol)
-        if entry is None:
-            logger.info(f"{symbol}: No real-time price, skipping.")
-            continue
-
-        # --- ORDER BLOCK + RETEST (loose/strict tolerance) ---
-        ob_levels = detect_order_blocks(candles_15m, side=side)
-        logger.info(f"{symbol}: Detected OB levels {ob_levels}")
+        # --- OB retest (loose if not strict) ---
+        ob_tol = 0.003 if STRICT_OBTEST else 0.005
         if not ob_levels:
             logger.info(f"{symbol}: No recent OB detected, skipping.")
             continue
-        ob_tol = 0.003 if STRICT_OBTEST else 0.005
-        if not is_retest(entry, ob_levels, side, tolerance=ob_tol):
+        if not STRICT_OB_RET and not is_retest(entry, ob_levels, side, tolerance=ob_tol):
             logger.info(f"{symbol}: Entry is NOT a retest of OB, skipping.")
             continue
 
@@ -860,14 +1019,15 @@ def best_intraday_signal_scan():
                 continue
 
         # --- TP1, TP2, TP3, TP4 ---
+        # Use strict_min_rr if set by strict logic
         if side == "long":
-            tp1 = round(entry + risk * min_rr, 6)
+            tp1 = round(entry + risk * strict_min_rr, 6)
             tp2 = round(entry + risk * max_rr, 6)
             resistances = sorted(set(c["high"] for c in candles_15m if c["high"] > tp2))
             tp3 = round(resistances[0], 6) if resistances else round(tp2 + atr, 6)
             tp4 = round(resistances[1], 6) if len(resistances) > 1 else round(tp3 + atr, 6)
         else:
-            tp1 = round(entry - risk * min_rr, 6)
+            tp1 = round(entry - risk * strict_min_rr, 6)
             tp2 = round(entry - risk * max_rr, 6)
             supports = sorted(set(c["low"] for c in candles_15m if c["low"] < tp2), reverse=True)
             tp3 = round(supports[0], 6) if supports else round(tp2 - atr, 6)
@@ -923,6 +1083,7 @@ def best_intraday_signal_scan():
 
 
 
+
 # Call this update_blacklist_on_sl(symbol) in your process_price_update after SL
 # Example (in your process_price_update, after setting entered=False for an SL):
 #    update_blacklist_on_sl(symbol)
@@ -951,29 +1112,149 @@ def process_price_update(symbol, price):
             continue  # Trade is done
 
         # TP1
+        # TP1 partial exit logic
         if not tp1_hit and tp1 is not None and (
             (side == "long" and price >= tp1) or (side == "short" and price <= tp1)):
-            send_message(f"🥳 {symbol} {side.upper()} TP1 @ {price}", CHAT_ID)
+            # Partial exit: close 25%
+            partial_vol = 0.25 * trade.get("remaining_volume", 1.0)
+            entry = float(trade["entry"])
+            if side == "long":
+                pnl = (price - entry) / entry * 100 * partial_vol
+            else:
+                pnl = (entry - price) / entry * 100 * partial_vol
+
+            # Update trade object for partial exit
+            trade["partial_exits"] = trade.get("partial_exits", [])
+            trade["partial_exits"].append({
+                "tp": "TP1",
+                "price": price,
+                "volume": partial_vol,
+                "pnl": pnl
+            })
+            trade["realized_pnl"] = trade.get("realized_pnl", 0.0) + pnl
+            trade["remaining_volume"] = trade.get("remaining_volume", 1.0) - partial_vol
             trade["tp1_hit"] = True
+
+            # Move SL to breakeven
+            trade["sl"] = trade["entry"]
+            trade["breakeven"] = True
+
+            send_message(
+                f"🥳 {symbol} {side.upper()} TP1 @ {price} | +{partial_vol*100:.0f}% position closed\n"
+                f"Realized PnL: {trade['realized_pnl']:.2f}% | Remaining: {trade['remaining_volume']*100:.0f}%\n"
+                f"SL moved to breakeven ({trade['entry']})!",
+                CHAT_ID
+            )
             changed = True
+
         # TP2
+        # TP2 partial exit logic
         if trade.get("tp1_hit") and not tp2_hit and tp2 is not None and (
             (side == "long" and price >= tp2) or (side == "short" and price <= tp2)):
-            send_message(f"🏆 {symbol} {side.upper()} TP2 @ {price}", CHAT_ID)
+            # Partial exit: close another 25%
+            partial_vol = 0.25 * trade.get("remaining_volume", 1.0)  # 25% of *current* remaining
+            entry = float(trade["entry"])
+            if side == "long":
+                pnl = (price - entry) / entry * 100 * partial_vol
+            else:
+                pnl = (entry - price) / entry * 100 * partial_vol
+
+            # Record this partial exit
+            trade["partial_exits"].append({
+                "tp": "TP2",
+                "price": price,
+                "volume": partial_vol,
+                "pnl": pnl
+            })
+            trade["realized_pnl"] = trade.get("realized_pnl", 0.0) + pnl
+            trade["remaining_volume"] = trade.get("remaining_volume", 1.0) - partial_vol
             trade["tp2_hit"] = True
+
+            # TRAIL stop-loss: move SL up (for long) or down (for short)
+            atr = calculate_atr(get_candles(symbol, "15", 20), 14)
+            if side == "long":
+                new_sl = price - atr * 0.7  # e.g. trail by 70% ATR below TP2
+            else:
+                new_sl = price + atr * 0.7  # trail by 70% ATR above TP2
+            trade["sl"] = round(new_sl, 6)
+            trade["trail"] = True
+
+            send_message(
+                f"🏆 {symbol} {side.upper()} TP2 @ {price} | +{partial_vol*100:.0f}% closed\n"
+                f"Realized PnL: {trade['realized_pnl']:.2f}% | Remaining: {trade['remaining_volume']*100:.0f}%\n"
+                f"SL trailed to {trade['sl']}!",
+                CHAT_ID
+            )
             changed = True
+
         # TP3
+        # TP3 partial exit logic
         if trade.get("tp2_hit") and not tp3_hit and tp3 is not None and (
             (side == "long" and price >= tp3) or (side == "short" and price <= tp3)):
-            send_message(f"🏅 {symbol} {side.upper()} TP3 @ {price}", CHAT_ID)
+            # Partial exit: close another 25% of remaining
+            partial_vol = 0.25 * trade.get("remaining_volume", 1.0)
+            entry = float(trade["entry"])
+            if side == "long":
+                pnl = (price - entry) / entry * 100 * partial_vol
+            else:
+                pnl = (entry - price) / entry * 100 * partial_vol
+
+            trade["partial_exits"].append({
+                "tp": "TP3",
+                "price": price,
+                "volume": partial_vol,
+                "pnl": pnl
+            })
+            trade["realized_pnl"] = trade.get("realized_pnl", 0.0) + pnl
+            trade["remaining_volume"] = trade.get("remaining_volume", 1.0) - partial_vol
             trade["tp3_hit"] = True
+
+            # TRAIL SL again (even tighter)
+            atr = calculate_atr(get_candles(symbol, "15", 20), 14)
+            if side == "long":
+                new_sl = price - atr * 0.5  # trail by 50% ATR below TP3
+            else:
+                new_sl = price + atr * 0.5  # trail by 50% ATR above TP3
+            trade["sl"] = round(new_sl, 6)
+
+            send_message(
+                f"🏅 {symbol} {side.upper()} TP3 @ {price} | +{partial_vol*100:.0f}% closed\n"
+                f"Realized PnL: {trade['realized_pnl']:.2f}% | Remaining: {trade['remaining_volume']*100:.0f}%\n"
+                f"SL trailed to {trade['sl']}!",
+                CHAT_ID
+            )
             changed = True
+
         # TP4 and close
+        # TP4 — Final full exit
         if trade.get("tp3_hit") and tp4 is not None and (
             (side == "long" and price >= tp4) or (side == "short" and price <= tp4)):
-            send_message(f"🎯 {symbol} {side.upper()} TP4 @ {price}\nTrade completed!", CHAT_ID)
+            # Close ALL remaining position
+            final_vol = trade.get("remaining_volume", 1.0)
+            entry = float(trade["entry"])
+            if side == "long":
+                pnl = (price - entry) / entry * 100 * final_vol
+            else:
+                pnl = (entry - price) / entry * 100 * final_vol
+
+            trade["partial_exits"].append({
+                "tp": "TP4",
+                "price": price,
+                "volume": final_vol,
+                "pnl": pnl
+            })
+            trade["realized_pnl"] = trade.get("realized_pnl", 0.0) + pnl
+            trade["remaining_volume"] = 0.0
             trade["entered"] = False
+
+            send_message(
+                f"🎯 {symbol} {side.upper()} TP4 @ {price} | 100% closed\n"
+                f"Final Realized PnL: {trade['realized_pnl']:.2f}%\n"
+                f"Trade completed!",
+                CHAT_ID
+            )
             changed = True
+
     if changed:
         save_trades(trades)
 def handle_trades_command(chat_id):
@@ -1161,8 +1442,8 @@ def handle_history_command(chat_id):
                           "TP2" if t.get("tp1_hit") else "SL/Manual"
             pnl = "N/A"
             close_price = t.get("close_price", "N/A")
-            close_time_raw = t.get("close_time")
-            close_time = format_time(close_time_raw)
+            closed_time_raw = t.get("closed_time")
+            closed_time = format_time(closed_time_raw)
             try:
                 entry = float(t['entry'])
                 close_price = float(t.get('close_price', entry))  # Use the recorded close price, fallback to entry if not present
@@ -1182,7 +1463,7 @@ def handle_history_command(chat_id):
             msg += (
                 f"{t['symbol']} {t['side'].upper()} {state}\n"
                 f"Entry: `{t['entry']}` | Exit: `{exit_status}` | Closed at: `{close_price}`\n"
-                f"Close Time: `{close_time}` | PnL: {pnl}\n"
+                f"Close Time: `{closed_time}` | PnL: {pnl}\n"
                 "\n"
             )
         send_message(msg, chat_id)
@@ -1190,7 +1471,7 @@ def handle_history_command(chat_id):
 def send_daily_stats():
     trades = load_trades()
     today = datetime.now().date()
-    day_trades = [t for t in trades if t.get("close_time") and datetime.fromtimestamp(t["close_time"]).date() == today]
+    day_trades = [t for t in trades if t.get("closed_time") and datetime.fromtimestamp(t["closed_time"]).date() == today]
     if not day_trades:
         send_message("No closed trades today.", CHAT_ID)
         return
@@ -1430,7 +1711,7 @@ def telegram_webhook():
             for t in trades:
                 if t["symbol"] == symbol and t.get("entered", False):
                     t["entered"] = False
-                    t["close_time"] = now        # Save close time (Unix timestamp)
+                    t["closed_time"] = now        # Save close time (Unix timestamp)
                     t["close_price"] = price     # Save close price (or None if price unavailable)
             save_trades(trades)
             send_message(f"❌ Trade closed for {symbol} at price {price} (time: {now})", from_user)
@@ -1482,6 +1763,7 @@ if __name__ == "__main__":
     scheduler.add_job(check_trend_shift, "interval", minutes=1)
     # --- Add scheduler job ---
     scheduler.add_job(send_daily_stats, "cron", hour=23, minute=0)  # Sends at 23:00 every day
+    scheduler.add_job(check_trades, "interval", seconds=60)  # checks every 30s, change as needed
 
     scheduler.start()
     logger.info("Scheduled main intraday scan and trend shift check.")
