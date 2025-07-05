@@ -24,7 +24,12 @@ SIGNAL_COOLDOWN_SEC = 900
 SL_COUNTER_FILE = "sl_counters.json"
 # Global strict mode toggle
 STRICT_LEVEL = 0  # Default to loose mode
-
+STRICT_EMA = False
+STRICT_SMC = False
+STRICT_VOLUME = False
+STRICT_MACD = False
+STRICT_BREAKOUT = False
+STRICT_OBTEST = False
 from flask import Flask, request
 from apscheduler.schedulers.background import BackgroundScheduler
 from websocket import WebSocketApp
